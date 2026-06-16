@@ -32,7 +32,7 @@ KAGGLE_USER  = os.environ.get('KAGGLE_USERNAME', '')
 KAGGLE_KEY   = os.environ.get('KAGGLE_KEY', '')
 
 # Public S3 base
-S3_BASE = 'https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com'
+S3_BASE = 'https://dl.ash2txt.org'
 
 # ── Minimal 3D U-Net ──────────────────────────────────────────────────────────
 class DoubleConv(nn.Module):
@@ -92,7 +92,7 @@ def load_model():
 def list_segments():
     """Fetch list of available segment IDs for Scroll 3"""
     # Try to get segment listing from S3
-    url = f'{S3_BASE}/{SCROLL_PATH}/segments/'
+    url = f'{S3_BASE}/full-scrolls/Scroll3/PHerc332.volpkg/paths/'
     try:
         r = requests.get(url, timeout=15)
         if r.status_code == 200:
@@ -115,7 +115,7 @@ def fetch_surface_layer(segment_id, layer_num):
     Downloads a single layer from a segment's surface volume.
     Surface volumes are stored as TIFFs: paths/{segment_id}/layers/{layer:02d}.tif
     """
-    url = f'{S3_BASE}/{SCROLL_PATH}/segments/{segment_id}/layers/{layer_num:02d}.tif'
+    url = f'{S3_BASE}/full-scrolls/Scroll3/PHerc332.volpkg/paths/{segment_id}/layers/{layer_num:02d}.tif'
     print(f'[FETCH] {url}')
     try:
         r = requests.get(url, timeout=30)
