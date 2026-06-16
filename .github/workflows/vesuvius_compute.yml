@@ -2,7 +2,7 @@ name: Vesuvius Scroll Processor
 
 on:
   repository_dispatch:
-    types: [process_patch]
+    types: [process_patch, process_segment]
 
 jobs:
   process:
