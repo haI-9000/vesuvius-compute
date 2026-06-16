@@ -183,10 +183,22 @@ def main():
 
     print(f'[START] Scroll=Scroll3/PHerc332 segment={seg_id} layer={LAYER}')
 
-    # 1. Fetch composite image
+    # 1. Fetch composite image — fall back to middle layer if not available
     composite = fetch_composite(seg_id)
     if composite is None:
-        post_callback({'error': 'no_composite', 'segment_id': seg_id, 'job_id': JOB_ID})
+        print('[COMPOSITE] Not found, falling back to layer analysis')
+        # Try fetching middle layer as substitute
+        for l in [15, 14, 16, 13, 17, 10, 20]:
+            sl = fetch_layer(seg_id, l)
+            if sl is not None:
+                # Normalize
+                sl_min, sl_max = sl.min(), sl.max()
+                if sl_max > sl_min:
+                    composite = (sl - sl_min) / (sl_max - sl_min)
+                    print(f'[FALLBACK] Using layer {l:02d} shape={composite.shape}')
+                    break
+    if composite is None:
+        post_callback({'error': 'no_data', 'segment_id': seg_id, 'job_id': JOB_ID})
         return
 
     # 2. Run ink heuristic on composite
