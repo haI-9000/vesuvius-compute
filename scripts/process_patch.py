@@ -72,40 +72,65 @@ class InkUNet(nn.Module):
         d1 = self.dec1(torch.cat([self.up1(d2), e1], 1))
         return torch.sigmoid(self.out(d1))
 
-# ── Load pretrained weights if available ─────────────────────────────────────
+# ── Load pretrained weights ───────────────────────────────────────────────────
 def load_model():
     model = InkUNet()
-    # Official Vesuvius Grand Prize winning model checkpoints
-    # Try multiple known checkpoint URLs
-    checkpoint_urls = [
-        'https://github.com/younader/Vesuvius-Grandprize-Entry/releases/download/v1.0/model.pth',
+    loaded = False
+    weights_path = '/tmp/ink_model.pth'
+
+    # Try HuggingFace first — no auth needed
+    hf_urls = [
+        'https://huggingface.co/scrollprize/ink_detection/resolve/main/model.pth',
         'https://huggingface.co/YoussefNader/VesuviusInkDetection/resolve/main/model.pth',
     ]
-    weights_path = '/tmp/ink_model.pth'
-    loaded = False
-    for url in checkpoint_urls:
+    for url in hf_urls:
         try:
-            print(f'[MODEL] Trying checkpoint: {url}')
-            r = requests.get(url, timeout=30, stream=True)
+            print(f'[MODEL] Trying: {url}')
+            r = requests.get(url, timeout=60, stream=True, allow_redirects=True)
             if r.status_code == 200:
                 with open(weights_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
-                state = torch.load(weights_path, map_location='cpu')
-                # Handle different checkpoint formats
+                file_size = os.path.getsize(weights_path)
+                if file_size > 100000:
+                    state = torch.load(weights_path, map_location='cpu')
+                    if isinstance(state, dict) and 'model_state_dict' in state:
+                        state = state['model_state_dict']
+                    elif isinstance(state, dict) and 'state_dict' in state:
+                        state = state['state_dict']
+                    model.load_state_dict(state, strict=False)
+                    print(f'[MODEL] Loaded {file_size//1024}KB weights from HuggingFace')
+                    loaded = True
+                    break
+        except Exception as e:
+            print(f'[MODEL] HF {url} failed: {e}')
+
+    # Try Kaggle if HF failed
+    kaggle_user = os.environ.get('KAGGLE_USERNAME')
+    kaggle_key  = os.environ.get('KAGGLE_KEY')
+    if not loaded and kaggle_user and kaggle_key:
+        try:
+            print('[MODEL] Trying Kaggle...')
+            os.makedirs(os.path.expanduser('~/.kaggle'), exist_ok=True)
+            import json, glob
+            with open(os.path.expanduser('~/.kaggle/kaggle.json'), 'w') as f:
+                json.dump({'username': kaggle_user, 'key': kaggle_key}, f)
+            os.chmod(os.path.expanduser('~/.kaggle/kaggle.json'), 0o600)
+            os.system('pip install kaggle -q')
+            os.system('kaggle datasets download -d ryches/unet3d -p /tmp/unet3d --unzip -q')
+            pth_files = glob.glob('/tmp/unet3d/*.pth')
+            if pth_files:
+                state = torch.load(pth_files[0], map_location='cpu')
                 if isinstance(state, dict) and 'model_state_dict' in state:
                     state = state['model_state_dict']
                 model.load_state_dict(state, strict=False)
-                print(f'[MODEL] Loaded pretrained weights from {url}')
+                print(f'[MODEL] Loaded Kaggle weights: {pth_files[0]}')
                 loaded = True
-                break
         except Exception as e:
-            print(f'[MODEL] Checkpoint {url} failed: {e}')
-            continue
+            print(f'[MODEL] Kaggle failed: {e}')
 
     if not loaded:
-        print('[MODEL] No pretrained weights available — using heuristic mode')
-        print('[MODEL] Note: add official checkpoint URL for better ink detection')
+        print('[MODEL] Using heuristic mode — random weights, scores are noise')
 
     model.eval()
     return model
