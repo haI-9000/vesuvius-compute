@@ -23,7 +23,7 @@ import glob
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SEGMENT_ID   = os.environ.get('SEGMENT_ID', '')
-SCROLL_PATH  = os.environ.get('SCROLL_PATH', 'Scroll3.volpkg')
+SCROLL_PATH  = os.environ.get('SCROLL_PATH', 'Scroll3/PHerc332.volpkg')
 LAYER        = int(os.environ.get('LAYER', '32'))       # which layer of surface volume
 CALLBACK_URL = os.environ.get('CALLBACK_URL', '')
 JOB_ID       = os.environ.get('JOB_ID', 'unknown')
