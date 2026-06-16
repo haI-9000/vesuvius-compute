@@ -33,10 +33,17 @@ BASE_URL = 'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths'
 def fetch_composite(segment_id):
     url = f'{BASE_URL}/{segment_id}/composite.jpg'
     try:
-        r = requests.get(url, timeout=30)
+        r = requests.get(url, timeout=60)
         if r.status_code == 200:
             from PIL import Image
+            # Disable size limit and immediately downsample
+            Image.MAX_IMAGE_PIXELS = None
             img = Image.open(io.BytesIO(r.content)).convert('L')
+            # Downsample to max 2048px on longest side
+            w, h = img.size
+            scale = min(2048/w, 2048/h)
+            if scale < 1.0:
+                img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
             arr = np.array(img, dtype=np.float32) / 255.0
             print(f'[COMPOSITE] {arr.shape} mean={arr.mean():.4f} std={arr.std():.4f}')
             return arr
