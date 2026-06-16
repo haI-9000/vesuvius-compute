@@ -113,27 +113,33 @@ def list_segments():
 def fetch_surface_layer(segment_id, layer_num):
     """
     Downloads a single layer from a segment's surface volume.
-    Surface volumes are stored as TIFFs: paths/{segment_id}/layers/{layer:02d}.tif
+    Some segments use .tif, others use .jpg
     """
-    url = f'{S3_BASE}/full-scrolls/Scroll3/PHerc332.volpkg/paths/{segment_id}/layers/{layer_num:02d}.tif'
-    print(f'[FETCH] {url}')
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code == 200:
-            try:
-                import tifffile
-                img = tifffile.imread(io.BytesIO(r.content))
-                return img.astype(np.float32)
-            except Exception:
-                data = np.frombuffer(r.content[8:], dtype=np.uint16)
-                side = int(np.sqrt(len(data)))
-                return data[:side*side].reshape(side, side).astype(np.float32)
-        else:
-            print(f'[FETCH] HTTP {r.status_code}')
-            return None
-    except Exception as e:
-        print(f'[FETCH] Error: {e}')
-        return None
+    base_url = f'{S3_BASE}/full-scrolls/Scroll3/PHerc332.volpkg/paths/{segment_id}/layers/{layer_num:02d}'
+    
+    for ext in ['.tif', '.jpg']:
+        url = base_url + ext
+        try:
+            r = requests.get(url, timeout=30)
+            if r.status_code == 200:
+                print(f'[FETCH] {url}')
+                try:
+                    import tifffile
+                    img = tifffile.imread(io.BytesIO(r.content))
+                    return img.astype(np.float32)
+                except Exception:
+                    # Try PIL for jpg
+                    try:
+                        from PIL import Image
+                        img = Image.open(io.BytesIO(r.content)).convert('L')
+                        return np.array(img, dtype=np.float32)
+                    except Exception:
+                        data = np.frombuffer(r.content[8:], dtype=np.uint16)
+                        side = int(np.sqrt(len(data)))
+                        return data[:side*side].reshape(side, side).astype(np.float32)
+        except Exception as e:
+            pass
+    return None
 
 # ── Connected components ──────────────────────────────────────────────────────
 def count_ink_blobs(prob_map, threshold=0.75, min_size=30):
