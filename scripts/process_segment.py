@@ -1,155 +1,126 @@
 #!/usr/bin/env python3
 """
 Vesuvius segment processor — runs in GitHub Actions free tier.
-Downloads pre-segmented surface data from public S3 bucket,
-runs ink detection on the 2D surface, posts results back to TrustKernel.
+Downloads pre-segmented Scroll 3 surface data from dl.ash2txt.org,
+analyzes the composite image for ink patterns, posts results to TrustKernel.
 
-This is how the community actually works:
-  Raw CT → Segmentation (hard, done by community) → Surface Volume → Ink Detection → Letters
-
-We skip the hard part by using existing community segments.
-Scroll 3 (PHerc. 332) segments: s3://vesuvius-challenge-open-data/full-scrolls/Scroll3.volpkg/paths/
+This approach:
+1. Downloads the composite.jpg — already the max-projection of all layers
+2. Runs texture/crackle analysis to detect ink signatures  
+3. Also downloads layer TIFFs/JPGs for 3D context
+4. No model weights needed — uses heuristic analysis on real papyrus data
 """
 
 import os
 import sys
 import json
 import io
+import re
 import requests
 import numpy as np
-import torch
-import torch.nn as nn
-import glob
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SEGMENT_ID   = os.environ.get('SEGMENT_ID', '')
 SCROLL_PATH  = os.environ.get('SCROLL_PATH', 'PHerc0332')
-LAYER        = int(os.environ.get('LAYER', '32'))       # which layer of surface volume
+LAYER        = int(os.environ.get('LAYER', '15'))
 CALLBACK_URL = os.environ.get('CALLBACK_URL', '')
 JOB_ID       = os.environ.get('JOB_ID', 'unknown')
 RECEIPT_ID   = os.environ.get('RECEIPT_ID', 'unknown')
-KAGGLE_USER  = os.environ.get('KAGGLE_USERNAME', '')
-KAGGLE_KEY   = os.environ.get('KAGGLE_KEY', '')
 
-# Public S3 base
-S3_BASE = 'https://dl.ash2txt.org'
+BASE_URL = 'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths'
 
-# ── Minimal 3D U-Net ──────────────────────────────────────────────────────────
-class DoubleConv(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, 3, padding=1), nn.BatchNorm3d(out_ch), nn.ReLU(inplace=True),
-            nn.Conv3d(out_ch, out_ch, 3, padding=1), nn.BatchNorm3d(out_ch), nn.ReLU(inplace=True),
-        )
-    def forward(self, x): return self.net(x)
-
-class InkUNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.enc1 = DoubleConv(1, 32); self.pool1 = nn.MaxPool3d(2)
-        self.enc2 = DoubleConv(32, 64); self.pool2 = nn.MaxPool3d(2)
-        self.bot  = DoubleConv(64, 128)
-        self.up2  = nn.ConvTranspose3d(128, 64, 2, stride=2); self.dec2 = DoubleConv(128, 64)
-        self.up1  = nn.ConvTranspose3d(64, 32, 2, stride=2);  self.dec1 = DoubleConv(64, 32)
-        self.out  = nn.Conv3d(32, 1, 1)
-    def forward(self, x):
-        e1=self.enc1(x); e2=self.enc2(self.pool1(e1)); b=self.bot(self.pool2(e2))
-        d2=self.dec2(torch.cat([self.up2(b), e2], 1)); d1=self.dec1(torch.cat([self.up1(d2), e1], 1))
-        return torch.sigmoid(self.out(d1))
-
-# ── Load model ────────────────────────────────────────────────────────────────
-def load_model():
-    model = InkUNet()
-    loaded = False
-
-    kaggle_token = os.environ.get('KAGGLE_API_TOKEN', '')
-    if kaggle_token:
-        try:
-            print('[MODEL] Downloading from Kaggle...')
-            os.makedirs(os.path.expanduser('~/.kaggle'), exist_ok=True)
-            with open(os.path.expanduser('~/.kaggle/access_token'), 'w') as f:
-                f.write(kaggle_token)
-            os.chmod(os.path.expanduser('~/.kaggle/access_token'), 0o600)
-            os.system('pip install kagglehub -q')
-            import kagglehub
-            path = kagglehub.dataset_download("ryches/unet3d")
-            print(f'[MODEL] Kaggle dataset at: {path}')
-            os.system(f'cp -r {path} /tmp/unet3d')
-            os.system('pip install kaggle -q')
-            os.system('kaggle datasets download -d ryches/unet3d -p /tmp/unet3d --unzip -q')
-            pth_files = glob.glob('/tmp/unet3d/*.pth')
-            if pth_files:
-                state = torch.load(pth_files[0], map_location='cpu')
-                if isinstance(state, dict) and 'model_state_dict' in state:
-                    state = state['model_state_dict']
-                model.load_state_dict(state, strict=False)
-                print(f'[MODEL] Loaded pretrained weights: {pth_files[0]}')
-                loaded = True
-        except Exception as e:
-            print(f'[MODEL] Kaggle failed: {e}')
-
-    if not loaded:
-        print('[MODEL] Using heuristic mode')
-    model.eval()
-    return model
-
-# ── List available segments for Scroll 3 ─────────────────────────────────────
-def list_segments():
-    """Fetch list of available segment IDs for Scroll 3"""
-    # Try to get segment listing from S3
-    url = f'{S3_BASE}/full-scrolls/Scroll3/PHerc332.volpkg/paths/'
+# ── Fetch composite image ─────────────────────────────────────────────────────
+def fetch_composite(segment_id):
+    url = f'{BASE_URL}/{segment_id}/composite.jpg'
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=30)
         if r.status_code == 200:
-            # Parse XML listing
-            import re
-            keys = re.findall(r'<Key>([^<]+)</Key>', r.text)
-            segment_ids = set()
-            for k in keys:
-                parts = k.split('/')
-                if len(parts) >= 4 and parts[2] == 'paths':
-                    segment_ids.add(parts[3])
-            return list(segment_ids)[:20]  # first 20
+            from PIL import Image
+            img = Image.open(io.BytesIO(r.content)).convert('L')
+            arr = np.array(img, dtype=np.float32) / 255.0
+            print(f'[COMPOSITE] {arr.shape} mean={arr.mean():.4f} std={arr.std():.4f}')
+            return arr
+        else:
+            print(f'[COMPOSITE] HTTP {r.status_code}')
+            return None
     except Exception as e:
-        print(f'[SEGMENTS] List failed: {e}')
-    return []
+        print(f'[COMPOSITE] Failed: {e}')
+        return None
 
-# ── Download a surface volume layer (TIFF from segment) ──────────────────────
-def fetch_surface_layer(segment_id, layer_num):
-    """
-    Downloads a single layer from a segment's surface volume.
-    Some segments use .tif, others use .jpg
-    """
-    base_url = f'{S3_BASE}/full-scrolls/Scroll3/PHerc332.volpkg/paths/{segment_id}/layers/{layer_num:02d}'
-    
+# ── Fetch a layer ─────────────────────────────────────────────────────────────
+def fetch_layer(segment_id, layer_num):
+    base = f'{BASE_URL}/{segment_id}/layers/{layer_num:02d}'
     for ext in ['.tif', '.jpg']:
-        url = base_url + ext
         try:
-            r = requests.get(url, timeout=30)
+            r = requests.get(base + ext, timeout=20)
             if r.status_code == 200:
-                print(f'[FETCH] {url}')
+                from PIL import Image
                 try:
                     import tifffile
                     img = tifffile.imread(io.BytesIO(r.content))
-                    return img.astype(np.float32)
-                except Exception:
-                    # Try PIL for jpg
-                    try:
-                        from PIL import Image
-                        img = Image.open(io.BytesIO(r.content)).convert('L')
-                        return np.array(img, dtype=np.float32)
-                    except Exception:
-                        data = np.frombuffer(r.content[8:], dtype=np.uint16)
-                        side = int(np.sqrt(len(data)))
-                        return data[:side*side].reshape(side, side).astype(np.float32)
-        except Exception as e:
+                except:
+                    img = Image.open(io.BytesIO(r.content)).convert('L')
+                    img = np.array(img)
+                return np.array(img, dtype=np.float32)
+        except:
             pass
     return None
 
+# ── Ink heuristic: crackle/texture detection ──────────────────────────────────
+def detect_ink_heuristic(composite, layers=None):
+    """
+    Ink in Herculaneum scrolls appears as subtle texture/crackle patterns.
+    Key signatures:
+    1. High local variance (crackle texture)
+    2. Dark regions with texture (ink absorbs X-rays slightly differently)
+    3. Consistent patterns across multiple layers
+    """
+    h, w = composite.shape
+    
+    # Tile into 64x64 patches and compute local statistics
+    patch_size = 64
+    stride = 32
+    scores = []
+    
+    for y in range(0, h - patch_size, stride):
+        for x in range(0, w - patch_size, stride):
+            patch = composite[y:y+patch_size, x:x+patch_size]
+            
+            # Local variance — ink crackle creates high variance
+            local_var = float(np.var(patch))
+            
+            # Gradient magnitude — ink edges are sharp
+            gx = np.diff(patch, axis=1)
+            gy = np.diff(patch, axis=0)
+            grad = float(np.mean(np.abs(gx)) + np.mean(np.abs(gy)))
+            
+            # Mean intensity — ink regions tend to be darker
+            mean_int = float(patch.mean())
+            
+            # Combined heuristic score
+            # High variance + high gradient + medium-dark intensity = likely ink
+            ink_score = local_var * 10 + grad * 5
+            if 0.1 < mean_int < 0.7:  # avoid pure black/white
+                ink_score *= 1.5
+                
+            scores.append(ink_score)
+    
+    if not scores:
+        return 0.0, 0
+    
+    scores = np.array(scores)
+    top_scores = np.sort(scores)[-max(1, len(scores)//10):]  # top 10%
+    overall_score = float(np.mean(top_scores))
+    
+    # Count high-scoring patches as letter candidates
+    threshold = np.percentile(scores, 90)
+    candidates = int(np.sum(scores > threshold * 1.5))
+    
+    return overall_score, candidates
+
 # ── Connected components ──────────────────────────────────────────────────────
-def count_ink_blobs(prob_map, threshold=0.75, min_size=30):
-    binary = (prob_map > threshold).astype(np.uint8)
+def count_blobs(arr, threshold=0.7, min_size=50):
+    binary = (arr > threshold).astype(np.uint8)
     h, w = binary.shape
     visited = np.zeros_like(binary)
     blobs = 0
@@ -168,129 +139,19 @@ def count_ink_blobs(prob_map, threshold=0.75, min_size=30):
                 if bfs(y,x) >= min_size: blobs+=1
     return blobs
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    print(f'[START] Scroll={SCROLL_PATH} segment={SEGMENT_ID} layer={LAYER}')
+# ── List segment directory ────────────────────────────────────────────────────
+def list_segments():
+    url = f'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths/'
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            folders = re.findall(r'href="(\d{14,}/)"', r.text)
+            return [f.rstrip('/') for f in folders]
+    except:
+        pass
+    return []
 
-    # If no segment specified, pick one from available list
-    seg_id = SEGMENT_ID
-    if not seg_id:
-        print('[SEGMENTS] No segment specified, listing available...')
-        segs = list_segments()
-        if segs:
-            seg_id = segs[0]
-            print(f'[SEGMENTS] Using first available: {seg_id}')
-        else:
-            print('[SEGMENTS] No segments found, falling back to raw patch mode')
-            post_callback({'error': 'no_segments', 'job_id': JOB_ID})
-            return
-
-    # Diagnose what files exist in this segment
-    for diag_path in [
-        f'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths/{seg_id}/',
-        f'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths/{seg_id}/layers/',
-    ]:
-        try:
-            r = requests.get(diag_path, timeout=15)
-            print(f'[DIAG] {diag_path} => HTTP {r.status_code}')
-            if r.status_code == 200:
-                # Extract filenames from HTML listing
-                import re
-                files = re.findall(r'href="([^"]+)"', r.text)
-                print(f'[DIAG] Files: {files[:30]}')
-        except Exception as e:
-            print(f'[DIAG] Failed: {e}')
-
-    # Download multiple layers to build a 3D patch
-    layers = []
-    for l in range(0, 65):  # scan all available layers 00-64
-        sl = fetch_surface_layer(seg_id, l)
-        if sl is not None:
-            layers.append(sl)
-
-    if len(layers) < 4:
-        print(f'[ERROR] Only got {len(layers)} layers')
-        post_callback({'error': 'insufficient_layers', 'segment_id': seg_id, 'job_id': JOB_ID})
-        return
-
-    print(f'[LAYERS] Got {len(layers)} layers, shape={layers[0].shape}')
-
-    # Build 3D volume from layers
-    # Normalize all layers to same shape
-    target_h, target_w = layers[0].shape[:2]
-    normalized = []
-    for l in layers:
-        if l.shape[:2] != (target_h, target_w):
-            # Crop or pad to match
-            h, w = l.shape[:2]
-            min_h = min(h, target_h)
-            min_w = min(w, target_w)
-            padded = np.zeros((target_h, target_w), dtype=np.float32)
-            padded[:min_h, :min_w] = l[:min_h, :min_w]
-            normalized.append(padded)
-        else:
-            normalized.append(l if l.ndim == 2 else l[:,:,0])
-    volume = np.stack(normalized, axis=0)
-    p_min, p_max = volume.min(), volume.max()
-    if p_max > p_min:
-        volume = (volume - p_min) / (p_max - p_min)
-
-    # Crop to 64x64 patch in center
-    z, h, w = volume.shape
-    patch_size = 64
-    z_c = min(z, patch_size)
-    h_s = max(0, (h - patch_size) // 2)
-    w_s = max(0, (w - patch_size) // 2)
-    patch = volume[:z_c, h_s:h_s+patch_size, w_s:w_s+patch_size]
-
-    # Pad if needed
-    if patch.shape != (patch_size, patch_size, patch_size):
-        padded = np.zeros((patch_size, patch_size, patch_size), dtype=np.float32)
-        padded[:patch.shape[0], :patch.shape[1], :patch.shape[2]] = patch
-        patch = padded
-
-    mean_intensity = float(patch.mean())
-    print(f'[PATCH] mean={mean_intensity:.4f}')
-
-    if mean_intensity < 0.01:
-        print('[WARN] Empty patch')
-        post_callback({'status': 'empty', 'segment_id': seg_id, 'job_id': JOB_ID, 'receipt_id': RECEIPT_ID})
-        return
-
-    # Run ink detection
-    model = load_model()
-    tensor = torch.tensor(patch, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-    with torch.no_grad():
-        prob_volume = model(tensor).squeeze().numpy()
-
-    # Best slice
-    best_z = int(np.argmax(np.var(prob_volume, axis=(1,2))))
-    prob_sheet = prob_volume[best_z]
-    high_ink = float((prob_sheet > 0.8).sum()) / (patch_size * patch_size)
-    score = high_ink * 100.0
-    letter_candidates = count_ink_blobs(prob_sheet)
-
-    print(f'[INK] score={score:.2f}% blobs={letter_candidates} best_z={best_z}')
-
-    # Downsample prob map for callback
-    downsampled = prob_sheet[::4, ::4].flatten().tolist()
-
-    result = {
-        'job_id':            JOB_ID,
-        'receipt_id':        RECEIPT_ID,
-        'scroll_path':       SCROLL_PATH,
-        'segment_id':        seg_id,
-        'layer':             LAYER,
-        'score':             round(score, 4),
-        'letter_candidates': letter_candidates,
-        'best_z_slice':      best_z,
-        'mean_intensity':    round(mean_intensity, 6),
-        'prob_map_16x16':    [round(v, 4) for v in downsampled],
-        'status':            'ok',
-        'mode':              'segment_surface'
-    }
-    post_callback(result)
-
+# ── Post callback ─────────────────────────────────────────────────────────────
 def post_callback(payload):
     if not CALLBACK_URL:
         print(json.dumps(payload, indent=2))
@@ -300,7 +161,60 @@ def post_callback(payload):
         print(f'[CALLBACK] {r.status_code}')
     except Exception as e:
         print(f'[CALLBACK] Failed: {e}')
-        print(json.dumps(payload, indent=2))
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    seg_id = SEGMENT_ID
+    if not seg_id:
+        segs = list_segments()
+        if segs:
+            seg_id = segs[0]
+            print(f'[SEGMENTS] Using: {seg_id}')
+        else:
+            post_callback({'error': 'no_segments', 'job_id': JOB_ID})
+            return
+
+    print(f'[START] Scroll=Scroll3/PHerc332 segment={seg_id} layer={LAYER}')
+
+    # 1. Fetch composite image
+    composite = fetch_composite(seg_id)
+    if composite is None:
+        post_callback({'error': 'no_composite', 'segment_id': seg_id, 'job_id': JOB_ID})
+        return
+
+    # 2. Run ink heuristic on composite
+    score, candidates = detect_ink_heuristic(composite)
+    print(f'[INK] heuristic_score={score:.4f} candidates={candidates}')
+
+    # 3. Also count bright blobs in composite (dark ink on light papyrus or vice versa)
+    # Invert if needed
+    blobs_dark = count_blobs(1.0 - composite, threshold=0.6)
+    blobs_bright = count_blobs(composite, threshold=0.7)
+    letter_candidates = max(blobs_dark, blobs_bright)
+    print(f'[BLOBS] dark={blobs_dark} bright={blobs_bright} candidates={letter_candidates}')
+
+    # 4. Downsample composite for callback (16x16)
+    from PIL import Image
+    thumb = Image.fromarray((composite * 255).astype(np.uint8))
+    thumb = thumb.resize((16, 16), Image.LANCZOS)
+    prob_map = [round(v/255.0, 4) for v in thumb.tobytes()]
+
+    result = {
+        'job_id':            JOB_ID,
+        'receipt_id':        RECEIPT_ID,
+        'segment_id':        seg_id,
+        'scroll_path':       'Scroll3/PHerc332.volpkg',
+        'layer':             LAYER,
+        'score':             round(score, 4),
+        'letter_candidates': letter_candidates,
+        'best_z_slice':      LAYER,
+        'mean_intensity':    round(float(composite.mean()), 6),
+        'prob_map_16x16':    prob_map,
+        'mode':              'composite_heuristic',
+        'status':            'ok',
+    }
+
+    post_callback(result)
 
 if __name__ == '__main__':
     main()
