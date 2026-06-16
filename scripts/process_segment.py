@@ -191,7 +191,7 @@ def main():
 
     # Download multiple layers to build a 3D patch
     layers = []
-    for l in range(max(0, LAYER-16), LAYER+16):
+    for l in range(0, 65):  # scan all available layers 00-64
         sl = fetch_surface_layer(seg_id, l)
         if sl is not None:
             layers.append(sl)
