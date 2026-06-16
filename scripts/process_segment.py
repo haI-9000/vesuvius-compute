@@ -210,7 +210,21 @@ def main():
     print(f'[LAYERS] Got {len(layers)} layers, shape={layers[0].shape}')
 
     # Build 3D volume from layers
-    volume = np.stack(layers, axis=0)
+    # Normalize all layers to same shape
+    target_h, target_w = layers[0].shape[:2]
+    normalized = []
+    for l in layers:
+        if l.shape[:2] != (target_h, target_w):
+            # Crop or pad to match
+            h, w = l.shape[:2]
+            min_h = min(h, target_h)
+            min_w = min(w, target_w)
+            padded = np.zeros((target_h, target_w), dtype=np.float32)
+            padded[:min_h, :min_w] = l[:min_h, :min_w]
+            normalized.append(padded)
+        else:
+            normalized.append(l if l.ndim == 2 else l[:,:,0])
+    volume = np.stack(normalized, axis=0)
     p_min, p_max = volume.min(), volume.max()
     if p_max > p_min:
         volume = (volume - p_min) / (p_max - p_min)
