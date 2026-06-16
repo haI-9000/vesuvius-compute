@@ -75,21 +75,38 @@ class InkUNet(nn.Module):
 # ── Load pretrained weights if available ─────────────────────────────────────
 def load_model():
     model = InkUNet()
-    weights_path = 'ink_model.pth'
-    # Try to fetch the official checkpoint from the Vesuvius grand prize repo
-    checkpoint_url = 'https://github.com/younader/Vesuvius-Grandprize-Entry/releases/download/v1.0/model.pth'
-    try:
-        r = requests.get(checkpoint_url, timeout=30)
-        if r.status_code == 200:
-            with open(weights_path, 'wb') as f:
-                f.write(r.content)
-            state = torch.load(weights_path, map_location='cpu')
-            model.load_state_dict(state, strict=False)
-            print('[MODEL] Loaded pretrained weights')
-        else:
-            print('[MODEL] Checkpoint unavailable — using random init (heuristic mode)')
-    except Exception as e:
-        print(f'[MODEL] Weight load failed: {e} — using heuristic mode')
+    # Official Vesuvius Grand Prize winning model checkpoints
+    # Try multiple known checkpoint URLs
+    checkpoint_urls = [
+        'https://github.com/younader/Vesuvius-Grandprize-Entry/releases/download/v1.0/model.pth',
+        'https://huggingface.co/YoussefNader/VesuviusInkDetection/resolve/main/model.pth',
+    ]
+    weights_path = '/tmp/ink_model.pth'
+    loaded = False
+    for url in checkpoint_urls:
+        try:
+            print(f'[MODEL] Trying checkpoint: {url}')
+            r = requests.get(url, timeout=30, stream=True)
+            if r.status_code == 200:
+                with open(weights_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                state = torch.load(weights_path, map_location='cpu')
+                # Handle different checkpoint formats
+                if isinstance(state, dict) and 'model_state_dict' in state:
+                    state = state['model_state_dict']
+                model.load_state_dict(state, strict=False)
+                print(f'[MODEL] Loaded pretrained weights from {url}')
+                loaded = True
+                break
+        except Exception as e:
+            print(f'[MODEL] Checkpoint {url} failed: {e}')
+            continue
+
+    if not loaded:
+        print('[MODEL] No pretrained weights available — using heuristic mode')
+        print('[MODEL] Note: add official checkpoint URL for better ink detection')
+
     model.eval()
     return model
 
