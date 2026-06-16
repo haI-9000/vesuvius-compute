@@ -31,8 +31,7 @@ jobs:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           JOB_ID:       ${{ github.event.client_payload.job_id }}
           RECEIPT_ID:   ${{ github.event.client_payload.receipt_id }}
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: python scripts/process_patch.py
 
       - name: Process scroll segment
@@ -44,6 +43,5 @@ jobs:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           JOB_ID:       ${{ github.event.client_payload.job_id }}
           RECEIPT_ID:   ${{ github.event.client_payload.receipt_id }}
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: python scripts/process_segment.py
