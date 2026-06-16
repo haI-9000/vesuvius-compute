@@ -174,14 +174,20 @@ def main():
             return
 
     # Diagnose what files exist in this segment
-    diag_url = f'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths/{seg_id}/'
-    try:
-        r = requests.get(diag_url, timeout=15)
-        print(f'[DIAG] Segment index HTTP {r.status_code}')
-        if r.status_code == 200:
-            print(f'[DIAG] Contents: {r.text[:500]}')
-    except Exception as e:
-        print(f'[DIAG] Failed: {e}')
+    for diag_path in [
+        f'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths/{seg_id}/',
+        f'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths/{seg_id}/layers/',
+    ]:
+        try:
+            r = requests.get(diag_path, timeout=15)
+            print(f'[DIAG] {diag_path} => HTTP {r.status_code}')
+            if r.status_code == 200:
+                # Extract filenames from HTML listing
+                import re
+                files = re.findall(r'href="([^"]+)"', r.text)
+                print(f'[DIAG] Files: {files[:30]}')
+        except Exception as e:
+            print(f'[DIAG] Failed: {e}')
 
     # Download multiple layers to build a 3D patch
     layers = []
