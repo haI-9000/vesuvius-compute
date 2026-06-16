@@ -63,13 +63,19 @@ def load_model():
     model = InkUNet()
     loaded = False
 
-    if KAGGLE_USER and KAGGLE_KEY:
+    kaggle_token = os.environ.get('KAGGLE_API_TOKEN', '')
+    if kaggle_token:
         try:
             print('[MODEL] Downloading from Kaggle...')
             os.makedirs(os.path.expanduser('~/.kaggle'), exist_ok=True)
-            with open(os.path.expanduser('~/.kaggle/kaggle.json'), 'w') as f:
-                json.dump({'username': KAGGLE_USER, 'key': KAGGLE_KEY}, f)
-            os.chmod(os.path.expanduser('~/.kaggle/kaggle.json'), 0o600)
+            with open(os.path.expanduser('~/.kaggle/access_token'), 'w') as f:
+                f.write(kaggle_token)
+            os.chmod(os.path.expanduser('~/.kaggle/access_token'), 0o600)
+            os.system('pip install kagglehub -q')
+            import kagglehub
+            path = kagglehub.dataset_download("ryches/unet3d")
+            print(f'[MODEL] Kaggle dataset at: {path}')
+            os.system(f'cp -r {path} /tmp/unet3d')
             os.system('pip install kaggle -q')
             os.system('kaggle datasets download -d ryches/unet3d -p /tmp/unet3d --unzip -q')
             pth_files = glob.glob('/tmp/unet3d/*.pth')
