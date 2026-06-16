@@ -17,7 +17,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install numpy torch tifffile requests boto3
+        run: pip install numpy torch tifffile requests boto3 Pillow
 
       - name: Process scroll patch
         if: github.event.action == 'process_patch'
