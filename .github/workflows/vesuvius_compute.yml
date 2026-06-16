@@ -20,6 +20,7 @@ jobs:
         run: pip install numpy torch tifffile requests boto3
 
       - name: Process scroll patch
+        if: github.event.action == 'process_patch'
         env:
           SCROLL_ID:    ${{ github.event.client_payload.scroll_id }}
           X:            ${{ github.event.client_payload.x }}
@@ -30,4 +31,19 @@ jobs:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           JOB_ID:       ${{ github.event.client_payload.job_id }}
           RECEIPT_ID:   ${{ github.event.client_payload.receipt_id }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
         run: python scripts/process_patch.py
+
+      - name: Process scroll segment
+        if: github.event.action == 'process_segment'
+        env:
+          SEGMENT_ID:   ${{ github.event.client_payload.segment_id }}
+          SCROLL_PATH:  ${{ github.event.client_payload.scroll_path }}
+          LAYER:        ${{ github.event.client_payload.layer }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          JOB_ID:       ${{ github.event.client_payload.job_id }}
+          RECEIPT_ID:   ${{ github.event.client_payload.receipt_id }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
+        run: python scripts/process_segment.py
