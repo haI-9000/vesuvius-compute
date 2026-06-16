@@ -173,6 +173,16 @@ def main():
             post_callback({'error': 'no_segments', 'job_id': JOB_ID})
             return
 
+    # Diagnose what files exist in this segment
+    diag_url = f'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths/{seg_id}/'
+    try:
+        r = requests.get(diag_url, timeout=15)
+        print(f'[DIAG] Segment index HTTP {r.status_code}')
+        if r.status_code == 200:
+            print(f'[DIAG] Contents: {r.text[:500]}')
+    except Exception as e:
+        print(f'[DIAG] Failed: {e}')
+
     # Download multiple layers to build a 3D patch
     layers = []
     for l in range(max(0, LAYER-16), LAYER+16):
