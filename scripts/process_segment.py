@@ -23,7 +23,7 @@ import glob
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SEGMENT_ID   = os.environ.get('SEGMENT_ID', '')
-SCROLL_PATH  = os.environ.get('SCROLL_PATH', 'Scroll3/PHerc332.volpkg')
+SCROLL_PATH  = os.environ.get('SCROLL_PATH', 'PHerc0332')
 LAYER        = int(os.environ.get('LAYER', '32'))       # which layer of surface volume
 CALLBACK_URL = os.environ.get('CALLBACK_URL', '')
 JOB_ID       = os.environ.get('JOB_ID', 'unknown')
@@ -92,7 +92,7 @@ def load_model():
 def list_segments():
     """Fetch list of available segment IDs for Scroll 3"""
     # Try to get segment listing from S3
-    url = f'{S3_BASE}/full-scrolls/{SCROLL_PATH}/paths/'
+    url = f'{S3_BASE}/{SCROLL_PATH}/segments/'
     try:
         r = requests.get(url, timeout=15)
         if r.status_code == 200:
@@ -115,7 +115,7 @@ def fetch_surface_layer(segment_id, layer_num):
     Downloads a single layer from a segment's surface volume.
     Surface volumes are stored as TIFFs: paths/{segment_id}/layers/{layer:02d}.tif
     """
-    url = f'{S3_BASE}/full-scrolls/{SCROLL_PATH}/paths/{segment_id}/layers/{layer_num:02d}.tif'
+    url = f'{S3_BASE}/{SCROLL_PATH}/segments/{segment_id}/layers/{layer_num:02d}.tif'
     print(f'[FETCH] {url}')
     try:
         r = requests.get(url, timeout=30)
