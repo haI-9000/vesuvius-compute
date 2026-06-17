@@ -4,10 +4,13 @@ on:
   repository_dispatch:
     types: [process_patch, process_segment]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -17,7 +20,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install numpy tifffile requests boto3 Pillow zarr fsspec aiohttp
+        run: pip install numpy tifffile requests Pillow
 
       - name: Process scroll patch
         if: github.event.action == 'process_patch'
