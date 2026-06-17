@@ -1,16 +1,48 @@
-"""
-Kaggle 1st Place Model Architecture (ryches team)
-3D UNETR + SegFormer ensemble for Vesuvius ink detection.
-
-This is the exact architecture that achieved private LB 0.682693.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.models.resnet import resnet34d, resnet10t
-from segmentation_models_pytorch.decoders.unet.decoder import DecoderBlock
 
+try:
+    from segmentation_models_pytorch.base.modules import DecoderBlock
+except ImportError:
+    try:
+        from segmentation_models_pytorch.decoders.unet.decoder import DecoderBlock
+    except ImportError:
+        class DecoderBlock(nn.Module):
+            def __init__(self, in_channels, skip_channels, out_channels, use_batchnorm=True, attention_type=None):
+                super().__init__()
+                self.conv1 = nn.Conv2d(in_channels + skip_channels, out_channels, kernel_size=3, padding=1)
+                self.bn1 = nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity()
+                self.relu1 = nn.ReLU(inplace=True)
+                self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+                self.bn2 = nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity()
+                self.relu2 = nn.ReLU(inplace=True)
+
+            def forward(self, x, skip):
+                if skip is not None:
+                    x = torch.cat([x, skip], dim=1)
+                x = self.conv1(x)
+                x = self.bn1(x)
+                x = self.relu1(x)
+                x = self.conv2(x)
+                x = self.bn2(x)
+                x = self.relu2(x)
+                return x
+
+try:
+    from timm.models.resnet import resnet34d, resnet10t
+except ImportError:
+    from torchvision.models import resnet34, resnet18
+    def resnet34d(pretrained=False, in_chans=3):
+        model = resnet34(pretrained=pretrained)
+        if in_chans != 3:
+            model.conv1 = nn.Conv2d(in_chans, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        return model
+    def resnet10t(pretrained=False, in_chans=3):
+        model = resnet18(pretrained=pretrained)
+        if in_chans != 3:
+            model.conv1 = nn.Conv2d(in_chans, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        return model
 
 class SmpUnetDecoder(nn.Module):
     def __init__(self, in_channel, skip_channel, out_channel):
@@ -30,17 +62,9 @@ class SmpUnetDecoder(nn.Module):
             d = block(d, s)
         return d
 
-
 class Net(nn.Module):
-    """
-    Main model architecture from 1st place Kaggle solution.
-    Two-stage: 3D CNN encoder + 2D SegFormer-like decoder.
-    """
     def __init__(self):
         super().__init__()
-        self.output_type = ['inference', 'loss']
-
-        # First stage: 3D CNN encoder (depth=16)
         self.encoder1 = resnet34d(pretrained=False, in_chans=16)
         self.decoder1 = SmpUnetDecoder(
             in_channel=512,
@@ -49,7 +73,6 @@ class Net(nn.Module):
         )
         self.logit1 = nn.Conv2d(64, 1, kernel_size=1)
 
-        # Second stage: 2D SegFormer-like decoder
         self.encoder2 = resnet10t(pretrained=False, in_chans=64)
         self.decoder2 = SmpUnetDecoder(
             in_channel=512,
@@ -59,10 +82,9 @@ class Net(nn.Module):
         self.logit2 = nn.Conv2d(32, 1, kernel_size=1)
 
     def forward(self, batch):
-        v = batch['volume']  # (B, depth, H, W)
+        v = batch['volume']
         B, C, H, W = v.shape
 
-        # Encoder 1
         x = v
         encoder = []
         x = self.encoder1.conv1(x)
@@ -79,13 +101,10 @@ class Net(nn.Module):
         x = self.encoder1.layer4(x)
         encoder.append(x)
 
-        # Decoder 1
         feature = encoder[-1]
         skip = encoder[:-1][::-1]
         last = self.decoder1(feature, skip)
-        logit1 = self.logit1(last)
 
-        # Encoder 2
         x = last
         encoder = []
         x = self.encoder2.layer1(x)
@@ -97,7 +116,6 @@ class Net(nn.Module):
         x = self.encoder2.layer4(x)
         encoder.append(x)
 
-        # Decoder 2
         feature = encoder[-1]
         skip = encoder[:-1][::-1]
         last = self.decoder2(feature, skip)
