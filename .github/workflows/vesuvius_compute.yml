@@ -18,7 +18,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy tifffile requests boto3 Pillow "transformers==4.35.0" accelerate safetensors timesformer_pytorch
+          pip install numpy tifffile requests boto3 Pillow transformers accelerate safetensors timesformer_pytorch huggingface_hub
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Process scroll patch
