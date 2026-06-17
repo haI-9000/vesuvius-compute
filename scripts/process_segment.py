@@ -165,20 +165,25 @@ def fetch_composite(seg_id):
 
 # ── Fetch layers ──────────────────────────────────────────────────────────────
 def fetch_layers(seg_id, ext, num_layers, max_layers=16):
-    indices = np.linspace(0, min(num_layers-1, 29), min(max_layers, num_layers), dtype=int)
+    # Sample evenly across available layers
+    max_idx = min(num_layers - 1, 64)  # cap at 65 layers
+    indices = np.linspace(0, max_idx, min(max_layers, num_layers), dtype=int)
     layers = []
     target_shape = None
     for idx in indices:
-        url = f'{BASE}/{seg_id}/layers/{idx:02d}{ext}'
-        r = fetch_url(url, timeout=30)
-        if r and r.status_code == 200:
-            arr = load_image(r.content, ext)
-            if arr is not None:
-                if target_shape is None:
-                    target_shape = arr.shape
-                if arr.shape == target_shape:
-                    layers.append(arr)
-                    print(f'[LAYER] {idx:02d}{ext} {arr.shape} mean={arr.mean():.4f}')
+        # Try both 2-digit and 3-digit zero padding
+        for fmt in [f'{idx:02d}', f'{idx:03d}', str(idx)]:
+            url = f'{BASE}/{seg_id}/layers/{fmt}{ext}'
+            r = fetch_url(url, timeout=30)
+            if r and r.status_code == 200:
+                arr = load_image(r.content, ext)
+                if arr is not None:
+                    if target_shape is None:
+                        target_shape = arr.shape
+                    if arr.shape == target_shape:
+                        layers.append(arr)
+                        print(f'[LAYER] {fmt}{ext} {arr.shape} mean={arr.mean():.4f}')
+                    break
     if layers:
         print(f'[LAYERS] {len(layers)} layers loaded')
     return layers
