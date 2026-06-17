@@ -10,7 +10,7 @@ env:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
       - uses: actions/checkout@v4
@@ -21,20 +21,6 @@ jobs:
 
       - name: Install dependencies
         run: pip install numpy tifffile requests Pillow
-
-      - name: Process scroll patch
-        if: github.event.action == 'process_patch'
-        env:
-          SCROLL_ID:    ${{ github.event.client_payload.scroll_id }}
-          X:            ${{ github.event.client_payload.x }}
-          Y:            ${{ github.event.client_payload.y }}
-          Z:            ${{ github.event.client_payload.z }}
-          PATCH_SIZE:   ${{ github.event.client_payload.patch_size }}
-          THRESHOLD:    ${{ github.event.client_payload.threshold }}
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-          JOB_ID:       ${{ github.event.client_payload.job_id }}
-          RECEIPT_ID:   ${{ github.event.client_payload.receipt_id }}
-        run: python scripts/process_patch.py
 
       - name: Process scroll segment
         if: github.event.action == 'process_segment'
