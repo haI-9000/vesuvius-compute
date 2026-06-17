@@ -19,8 +19,13 @@ jobs:
       - name: Install dependencies
         run: |
           pip install numpy tifffile requests boto3 Pillow
+          pip install scikit-image opencv-python
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install segmentation-models-pytorch timm scikit-image opencv-python transformers huggingface-hub
+          pip install timm==0.9.2
+          pip install segmentation-models-pytorch==0.3.3
+          pip install timesformer_pytorch
+          pip install transformers huggingface-hub
+          pip install kagglehub
 
       - name: Process scroll patch
         if: github.event.action == 'process_patch'
