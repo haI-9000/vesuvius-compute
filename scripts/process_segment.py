@@ -17,6 +17,13 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# Set HF token if available to avoid rate limiting
+import os as _os
+_hf_token = _os.environ.get('HF_TOKEN', '')
+if _hf_token:
+    _os.environ['HUGGING_FACE_HUB_TOKEN'] = _hf_token
+    _os.environ['HF_TOKEN'] = _hf_token
+
 SEGMENT_ID   = os.environ.get('SEGMENT_ID', '').strip()
 LAYER        = int(os.environ.get('LAYER', '15'))
 CALLBACK_URL = os.environ.get('CALLBACK_URL', '')
