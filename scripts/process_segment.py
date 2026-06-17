@@ -49,13 +49,16 @@ def overlay(seg):
     r = get(f'{BASE}/{seg}/layers-overlay/', timeout=5)
     if not r or r.status_code != 200:
         return None, None
+    print(f'[OVERLAY] {seg}')
     files = [f.strip('/') for f in re.findall(r'href="(\d[^"]+\.(?:png|jpg|tif))"', r.text)]
+    print(f'[OVERLAY] {files[:8]}')
     for f in files[:3]:
         ext = '.' + f.rsplit('.', 1)[-1]
         r2 = get(f'{BASE}/{seg}/layers-overlay/{f}', timeout=15)
         if r2 and r2.status_code == 200:
             arr = to_array(r2.content, ext)
             if arr is not None:
+                print(f'[OVERLAY] loaded {f} {arr.shape} mean={arr.mean():.4f}')
                 return arr, f
     return None, None
 
@@ -70,6 +73,7 @@ def composite(seg):
         if s < 1.0:
             img = img.resize((int(w*s), int(h*s)), Image.LANCZOS)
         arr = np.array(img, dtype=np.float32) / 255.0
+        print(f'[COMPOSITE] {arr.shape} mean={arr.mean():.4f}')
         return arr
     except:
         return None
@@ -82,6 +86,7 @@ def discover(seg):
         if files:
             info['ext'] = '.' + files[0].split('.')[-1]
             info['n'] = len(files)
+            print(f'[LAYERS] {len(files)} layers ext={info["ext"]}')
     r = get(f'{BASE}/{seg}/composite.jpg', timeout=5)
     if r and r.status_code == 200 and len(r.content) > 10000:
         info['has_composite'] = True
@@ -99,6 +104,7 @@ def fetch_layers(seg, ext, n, max_n=16):
                     if shape is None: shape = arr.shape
                     if arr.shape == shape:
                         layers.append(arr)
+                        print(f'[LAYER] {fmt}{ext} {arr.shape} mean={arr.mean():.4f}')
                     break
     return layers
 
@@ -109,23 +115,6 @@ def ink_score(img):
     # Score = mean + std (higher is more interesting)
     score = mean + std * 2
     return score, 0
-    if ps < 8: return 0.0, 0
-    st = ps // 2
-    scores = []
-    for y in range(0, h - ps, st):
-        for x in range(0, w - ps, st):
-            p = img[y:y+ps, x:x+ps]
-            v = float(np.var(p))
-            g = float(np.mean(np.abs(np.diff(p, axis=1))) + np.mean(np.abs(np.diff(p, axis=0))))
-            s = v * 10 + g * 5
-            if 0.05 < p.mean() < 0.85:
-                s *= 1.3
-            scores.append(s)
-    if not scores: return 0.0, 0
-    a = np.array(scores)
-    score = float(np.mean(np.sort(a)[-max(1, len(a)//10):]))
-    cands = int(np.sum(a > np.median(a) * 3))
-    return score, cands
 
 def callback(payload):
     if not CALLBACK_URL:
@@ -154,12 +143,18 @@ def main():
     elif layers:
         img, src = np.mean(layers, axis=0), 'layers'
     else:
+        print('[ERROR] no data')
         callback({'job_id': JOB_ID, 'segment_id': seg, 'score': 0.0,
                   'letter_candidates': 0, 'status': 'no_data'})
         return
 
     score, cands = ink_score(img)
     mean = float(img.mean())
+
+    print(f'[INK] score={score:.4f} cands={cands} mean={mean:.4f} src={src}')
+
+    thumb = Image.fromarray((img * 255).astype(np.uint8)).resize((16, 16), Image.LANCZOS)
+    prob_map = [round(v/255.0, 4) for v in thumb.tobytes()]
 
     callback({
         'job_id':            JOB_ID,
@@ -170,6 +165,7 @@ def main():
         'letter_candidates': cands,
         'best_z_slice':      LAYER,
         'mean_intensity':    round(mean, 6),
+        'prob_map_16x16':    prob_map,
         'mode':              src,
         'status':            'ok',
     })
