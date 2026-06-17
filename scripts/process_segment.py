@@ -1,24 +1,13 @@
 #!/usr/bin/env python3
-"""
-Vesuvius Scroll 3 Segment Processor — TrustKernel compute layer
-
-Integrates THREE inference paths:
-1. Kaggle 1st Place Model (3D UNETR + SegFormer ensemble) — PRIMARY
-2. TimeSformer (HuggingFace) — SECONDARY
-3. Heuristic (variance + gradient) — FALLBACK
-
-Runs on GitHub Actions free tier. No auth required for data.
-"""
-
 import os, sys, io, re, json, requests
 import numpy as np
 from PIL import Image
 import cv2
 import random
+import time
 
 Image.MAX_IMAGE_PIXELS = None
 
-# ── Config ────────────────────────────────────────────────────────────────────
 SEGMENT_ID   = os.environ.get('SEGMENT_ID', '').strip()
 LAYER        = int(os.environ.get('LAYER', '15'))
 CALLBACK_URL = os.environ.get('CALLBACK_URL', '')
@@ -34,7 +23,6 @@ KNOWN_SEGMENTS = [
     '20240715203740', '20240716140050', '20240716140051', '20240716140052',
 ]
 
-# ── HTTP fetch with retry ─────────────────────────────────────────────────────
 def fetch_url(url, timeout=45):
     for attempt in range(3):
         try:
@@ -43,9 +31,9 @@ def fetch_url(url, timeout=45):
         except Exception as e:
             if attempt == 2:
                 print(f'[FETCH] Failed: {url} — {e}')
+            time.sleep(1)
     return None
 
-# ── Load image ────────────────────────────────────────────────────────────────
 def load_image(content, ext='.jpg'):
     try:
         if ext in ('.tif', '.tiff'):
@@ -65,7 +53,6 @@ def load_image(content, ext='.jpg'):
         print(f'[LOAD] Error: {e}')
         return None
 
-# ── Discover segment ──────────────────────────────────────────────────────────
 def discover_segment(seg_id):
     info = {'has_composite': False, 'layer_ext': None, 'num_layers': 0}
     r = fetch_url(f'{BASE}/{seg_id}/layers/')
@@ -81,7 +68,6 @@ def discover_segment(seg_id):
         print(f'[DISCOVER] composite.jpg: {len(r.content)//1024}KB')
     return info
 
-# ── Fetch composite ───────────────────────────────────────────────────────────
 def fetch_composite(seg_id):
     r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=60)
     if not r or r.status_code != 200:
@@ -99,7 +85,6 @@ def fetch_composite(seg_id):
         print(f'[COMPOSITE] Error: {e}')
         return None
 
-# ── Fetch layers ──────────────────────────────────────────────────────────────
 def fetch_layers(seg_id, ext, num_layers, max_layers=16):
     max_idx = min(num_layers - 1, 64)
     indices = np.linspace(0, max_idx, min(max_layers, num_layers), dtype=int)
@@ -122,16 +107,15 @@ def fetch_layers(seg_id, ext, num_layers, max_layers=16):
         print(f'[LAYERS] {len(layers)} layers loaded')
     return layers
 
-# ============================================================================
-# INFERENCE PATH 1: Kaggle 1st Place Model (3D UNETR + SegFormer)
-# ============================================================================
-
 def load_kaggle_model():
-    """Load the 1st place Kaggle solution model."""
     try:
-        print('[KAGGLE] Loading 1st place model...')
+        print('[KAGGLE] Loading model...')
         import torch
-        from kaggle_model import Net
+        try:
+            from kaggle_model import Net
+        except ImportError:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from kaggle_model import Net
 
         weight_paths = [
             '/kaggle/input/ink-01-weight/fix-rot-00005904.model.pth',
@@ -150,13 +134,14 @@ def load_kaggle_model():
                 path = kagglehub.model_download('ryches/vesuvius-ink-detection-1st-place/fix-rot-00005904')
                 if os.path.exists(path):
                     weights_path = path
-            except ImportError:
+            except Exception:
                 pass
 
         if weights_path is None:
-            print('[KAGGLE] Weights not found — skipping')
+            print('[KAGGLE] Weights not found')
             return None
 
+        print(f'[KAGGLE] Loading weights from {weights_path}')
         model = Net()
         state = torch.load(weights_path, map_location='cpu')
         state_dict = state.get('state_dict', state)
@@ -165,27 +150,26 @@ def load_kaggle_model():
             if k.startswith('module.'):
                 k = k[7:]
             new_state_dict[k] = v
-        model.load_state_dict(new_state_dict, strict=True)
+        model.load_state_dict(new_state_dict, strict=False)
         model.eval()
-        print(f'[KAGGLE] Loaded 1st place model from {weights_path}')
+        print('[KAGGLE] Model loaded')
         return model
     except Exception as e:
-        print(f'[KAGGLE] Error loading model: {e}')
+        print(f'[KAGGLE] Error: {e}')
         return None
 
 def run_kaggle_inference(model, layers_stack):
-    """Run inference using the 1st place Kaggle model."""
-    import torch
     try:
+        import torch
+        from skimage.transform import resize
+
         depth = 16
         if len(layers_stack) < depth:
-            print(f'[KAGGLE] Only {len(layers_stack)} layers, need {depth}')
             return None, None
 
         indices = np.linspace(0, len(layers_stack)-1, depth, dtype=int)
         selected = [layers_stack[i] for i in indices]
 
-        from skimage.transform import resize
         resized = []
         for layer in selected:
             layer_norm = (layer - layer.min()) / (layer.max() - layer.min() + 1e-7)
@@ -211,31 +195,29 @@ def run_kaggle_inference(model, layers_stack):
         print(f'[KAGGLE] Inference error: {e}')
         return None, None
 
-# ============================================================================
-# INFERENCE PATH 2: TimeSformer (HuggingFace)
-# ============================================================================
-
 def load_timesformer():
-    """Load official Vesuvius TimeSformer from HuggingFace."""
     try:
-        print('[TIMESFORMER] Loading scrollprize/timesformer_large_scroll1_01122024...')
+        print('[TIMESFORMER] Loading...')
+        try:
+            import timesformer_pytorch
+        except ImportError:
+            print('[TIMESFORMER] timesformer_pytorch not installed')
+            return None
+
         from transformers import AutoModel
-        import torch
         model = AutoModel.from_pretrained(
             "scrollprize/timesformer_large_scroll1_01122024",
             trust_remote_code=True,
         )
         model.eval()
-        print(f'[TIMESFORMER] Loaded ({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)')
         return model
     except Exception as e:
-        print(f'[TIMESFORMER] Failed: {e}')
+        print(f'[TIMESFORMER] Error: {e}')
         return None
 
 def run_timesformer(model, layers_stack):
-    """Run inference using TimeSformer."""
-    import torch
     try:
+        import torch
         frames = []
         for layer in layers_stack[:16]:
             img = Image.fromarray((layer * 255).astype(np.uint8))
@@ -258,15 +240,11 @@ def run_timesformer(model, layers_stack):
                 feat = features[0].squeeze()
             feat_np = feat.numpy()
             score = float(np.std(feat_np))
-            print(f'[TIMESFORMER] feature_std={score:.4f}')
+            print(f'[TIMESFORMER] score={score:.4f}')
             return score
     except Exception as e:
         print(f'[TIMESFORMER] Inference error: {e}')
         return None
-
-# ============================================================================
-# INFERENCE PATH 3: Heuristic (variance + gradient)
-# ============================================================================
 
 def heuristic_ink(image):
     h, w = image.shape
@@ -296,15 +274,20 @@ def heuristic_ink(image):
     candidates = int(np.sum(arr > median * 3))
     return overall, candidates
 
-# ============================================================================
-# MAIN: Run all three inference paths
-# ============================================================================
+def post_callback(payload):
+    if not CALLBACK_URL:
+        print(json.dumps(payload, indent=2))
+        return
+    try:
+        r = requests.post(CALLBACK_URL, json=payload, timeout=15)
+        print(f'[CALLBACK] {r.status_code}')
+    except Exception as e:
+        print(f'[CALLBACK] error: {e}')
 
 def main():
     seg_id = SEGMENT_ID or random.choice(KNOWN_SEGMENTS)
     print(f'[START] segment={seg_id} layer={LAYER}')
 
-    # Check for community predictions
     community_pred_urls = [
         f'https://dl.ash2txt.org/community-uploads/bruniss/3d%20Ink%20/s3/{seg_id}/',
         f'https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s3/ink/{seg_id}/',
@@ -314,9 +297,8 @@ def main():
     for pred_url in community_pred_urls:
         r = fetch_url(pred_url, timeout=10)
         if r and r.status_code == 200 and len(r.content) > 200:
-            print(f'[COMMUNITY] Found predictions at: {pred_url}')
+            print(f'[COMMUNITY] Predictions: {pred_url}')
 
-    # Discover and load data
     info = discover_segment(seg_id)
     layers = []
     composite = None
@@ -334,37 +316,36 @@ def main():
         image = np.mean(layers, axis=0)
         source = 'layers_mean'
     else:
-        print('[ERROR] No data loaded')
+        print('[ERROR] No data')
         post_callback({
-            'job_id': JOB_ID, 'segment_id': seg_id,
-            'score': 0.0, 'letter_candidates': 0,
-            'status': 'no_data', 'mode': 'segment_surface'
+            'job_id': JOB_ID,
+            'receipt_id': RECEIPT_ID,
+            'segment_id': seg_id,
+            'score': 0.0,
+            'letter_candidates': 0,
+            'status': 'no_data',
+            'mode': 'segment_surface'
         })
         return
 
-    # Load models
     kaggle_model = load_kaggle_model()
     timesformer_model = load_timesformer()
 
     results = {}
 
-    # 1. Kaggle 1st Place (PRIMARY)
     if kaggle_model is not None and layers:
         kaggle_score, kaggle_candidates = run_kaggle_inference(kaggle_model, layers)
         if kaggle_score is not None:
             results['kaggle'] = {'score': kaggle_score, 'candidates': kaggle_candidates}
 
-    # 2. TimeSformer (SECONDARY)
     if timesformer_model is not None and layers:
         ts_score = run_timesformer(timesformer_model, layers)
         if ts_score is not None:
             results['timesformer'] = ts_score
 
-    # 3. Heuristic (FALLBACK)
     heuristic_score, heuristic_candidates = heuristic_ink(image)
     results['heuristic'] = {'score': heuristic_score, 'candidates': heuristic_candidates}
 
-    # Combine results: prefer Kaggle, then TimeSformer, then heuristic
     if 'kaggle' in results:
         final_score = results['kaggle']['score']
         candidates = results['kaggle']['candidates']
@@ -379,9 +360,8 @@ def main():
         mode = 'heuristic_only'
 
     mean_intensity = float(image.mean())
-    print(f'[INK] final_score={final_score:.4f} candidates={candidates} mean={mean_intensity:.4f} mode={mode}')
+    print(f'[INK] score={final_score:.4f} candidates={candidates} mean={mean_intensity:.4f} mode={mode}')
 
-    # Thumbnail
     thumb = Image.fromarray((image * 255).astype(np.uint8))
     thumb = thumb.resize((16, 16), Image.LANCZOS)
     prob_map = [round(v/255.0, 4) for v in thumb.tobytes()]
@@ -400,16 +380,6 @@ def main():
         'mode':              mode,
         'status':            'ok',
     })
-
-def post_callback(payload):
-    if not CALLBACK_URL:
-        print(json.dumps(payload, indent=2))
-        return
-    try:
-        r = requests.post(CALLBACK_URL, json=payload, timeout=15)
-        print(f'[CALLBACK] {r.status_code}')
-    except Exception as e:
-        print(f'[CALLBACK] error: {e}')
 
 if __name__ == '__main__':
     main()
