@@ -234,6 +234,23 @@ def main():
     seg_id = SEGMENT_ID or random.choice(KNOWN_SEGMENTS)
     print(f'[START] segment={seg_id} layer={LAYER}')
 
+    # First check if community ink predictions already exist for this segment
+    # Sean Johnson (bruniss) and Emel Ryan have posted predictions to community uploads
+    community_pred_urls = [
+        f'https://dl.ash2txt.org/community-uploads/bruniss/3d%20Ink%20/s3/{seg_id}/',
+        f'https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s3/ink/{seg_id}/',
+        f'https://dl.ash2txt.org/community-uploads/ryan/s3/{seg_id}/',
+        f'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths/{seg_id}/layers-overlay/',
+    ]
+    for pred_url in community_pred_urls:
+        r = fetch_url(pred_url, timeout=10)
+        if r and r.status_code == 200 and len(r.content) > 200:
+            print(f'[COMMUNITY] Found predictions at: {pred_url}')
+            # Extract any .png or .jpg prediction files
+            files = re.findall(r'href="([^"]+\.(?:png|jpg|zarr)[^"]*)"', r.text)
+            if files:
+                print(f'[COMMUNITY] Prediction files: {files[:5]}')
+
     # Discover what's available
     info = discover_segment(seg_id)
 
