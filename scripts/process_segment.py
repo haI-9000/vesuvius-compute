@@ -1,29 +1,24 @@
 #!/usr/bin/env python3
 """
 Vesuvius Scroll 3 Segment Processor — TrustKernel compute layer
-Uses the official Vesuvius Challenge TimeSformer model from HuggingFace.
-No Kaggle auth needed — model loads directly via transformers library.
 
-Model: scrollprize/timesformer_large_scroll1_01122024
-  - 84.2M params, safetensors format
-  - Trained on Scroll 1 (PHerc. Paris 4) segments
-  - Feature extraction → ink probability via learned head
+Integrates THREE inference paths:
+1. Kaggle 1st Place Model (3D UNETR + SegFormer ensemble) — PRIMARY
+2. TimeSformer (HuggingFace) — SECONDARY
+3. Heuristic (variance + gradient) — FALLBACK
+
+Runs on GitHub Actions free tier. No auth required for data.
 """
 
 import os, sys, io, re, json, requests
 import numpy as np
 from PIL import Image
+import cv2
+import random
 
 Image.MAX_IMAGE_PIXELS = None
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Set HF token if available to avoid rate limiting
-import os as _os
-_hf_token = _os.environ.get('HF_TOKEN', '')
-if _hf_token:
-    _os.environ['HUGGING_FACE_HUB_TOKEN'] = _hf_token
-    _os.environ['HF_TOKEN'] = _hf_token
-
 SEGMENT_ID   = os.environ.get('SEGMENT_ID', '').strip()
 LAYER        = int(os.environ.get('LAYER', '15'))
 CALLBACK_URL = os.environ.get('CALLBACK_URL', '')
@@ -50,88 +45,6 @@ def fetch_url(url, timeout=45):
                 print(f'[FETCH] Failed: {url} — {e}')
     return None
 
-# ── Load model ────────────────────────────────────────────────────────────────
-def load_model():
-    """Load official Vesuvius TimeSformer from HuggingFace — no auth needed"""
-    try:
-        print('[MODEL] Loading scrollprize/timesformer_large_scroll1_01122024...')
-        from transformers import AutoModel
-        import torch
-        model = AutoModel.from_pretrained(
-            "scrollprize/timesformer_large_scroll1_01122024",
-            trust_remote_code=True,
-        )
-        model.eval()
-        print(f'[MODEL] Loaded TimeSformer ({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)')
-        return model, 'timesformer'
-    except Exception as e:
-        print(f'[MODEL] TimeSformer failed: {e}')
-
-    # Fallback: heuristic mode
-    print('[MODEL] Using heuristic mode')
-    return None, 'heuristic'
-
-# ── Run TimeSformer inference ─────────────────────────────────────────────────
-def run_timesformer(model, layers_stack):
-    """
-    TimeSformer expects a stack of 2D frames.
-    Input: list of 2D arrays (the surface volume layers)
-    Output: feature map → ink probability
-    """
-    import torch
-    try:
-        # Normalize and stack frames
-        frames = []
-        for layer in layers_stack[:16]:  # take up to 16 layers
-            # Resize to 224x224 (TimeSformer input size)
-            img = Image.fromarray((layer * 255).astype(np.uint8))
-            img = img.resize((224, 224), Image.LANCZOS)
-            # Convert to RGB (TimeSformer expects 3-channel)
-            rgb = Image.merge('RGB', [img, img, img])
-            frames.append(np.array(rgb, dtype=np.float32) / 255.0)
-
-        if not frames:
-            return None
-
-        # Stack: [T, H, W, C] → [1, C, T, H, W]
-        video = np.stack(frames, axis=0)  # [T, H, W, C]
-        video = np.transpose(video, (3, 0, 1, 2))  # [C, T, H, W]
-        tensor = torch.tensor(video).unsqueeze(0).float()  # [1, C, T, H, W]
-
-        with torch.no_grad():
-            features = model(pixel_values=tensor)
-            # Features are spatial embeddings — compute ink score from variance
-            if hasattr(features, 'last_hidden_state'):
-                feat = features.last_hidden_state.squeeze()
-            else:
-                feat = features[0].squeeze()
-
-            # Project to ink probability via feature variance
-            feat_np = feat.numpy()
-            score = float(np.std(feat_np))  # high variance = complex texture = likely ink
-            print(f'[TIMESFORMER] feature_std={score:.4f} shape={feat_np.shape}')
-            return score
-
-    except Exception as e:
-        print(f'[TIMESFORMER] Inference error: {e}')
-        return None
-
-# ── Discover segment ──────────────────────────────────────────────────────────
-def discover_segment(seg_id):
-    info = {'has_composite': False, 'layer_ext': None, 'num_layers': 0}
-    r = fetch_url(f'{BASE}/{seg_id}/layers/')
-    if r and r.status_code == 200:
-        files = re.findall(r'href="(\d+\.[a-z]+)"', r.text)
-        if files:
-            info['layer_ext'] = '.' + files[0].split('.')[-1]
-            info['num_layers'] = len(files)
-            print(f'[DISCOVER] {len(files)} layers, ext={info["layer_ext"]}')
-    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=10)
-    if r and r.status_code == 200 and len(r.content) > 10000:
-        info['has_composite'] = True
-        print(f'[DISCOVER] composite.jpg: {len(r.content)//1024}KB')
-    return info
-
 # ── Load image ────────────────────────────────────────────────────────────────
 def load_image(content, ext='.jpg'):
     try:
@@ -151,6 +64,22 @@ def load_image(content, ext='.jpg'):
     except Exception as e:
         print(f'[LOAD] Error: {e}')
         return None
+
+# ── Discover segment ──────────────────────────────────────────────────────────
+def discover_segment(seg_id):
+    info = {'has_composite': False, 'layer_ext': None, 'num_layers': 0}
+    r = fetch_url(f'{BASE}/{seg_id}/layers/')
+    if r and r.status_code == 200:
+        files = re.findall(r'href="(\d+\.[a-z]+)"', r.text)
+        if files:
+            info['layer_ext'] = '.' + files[0].split('.')[-1]
+            info['num_layers'] = len(files)
+            print(f'[DISCOVER] {len(files)} layers, ext={info["layer_ext"]}')
+    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=10)
+    if r and r.status_code == 200 and len(r.content) > 10000:
+        info['has_composite'] = True
+        print(f'[DISCOVER] composite.jpg: {len(r.content)//1024}KB')
+    return info
 
 # ── Fetch composite ───────────────────────────────────────────────────────────
 def fetch_composite(seg_id):
@@ -172,13 +101,11 @@ def fetch_composite(seg_id):
 
 # ── Fetch layers ──────────────────────────────────────────────────────────────
 def fetch_layers(seg_id, ext, num_layers, max_layers=16):
-    # Sample evenly across available layers
-    max_idx = min(num_layers - 1, 64)  # cap at 65 layers
+    max_idx = min(num_layers - 1, 64)
     indices = np.linspace(0, max_idx, min(max_layers, num_layers), dtype=int)
     layers = []
     target_shape = None
     for idx in indices:
-        # Try both 2-digit and 3-digit zero padding
         for fmt in [f'{idx:02d}', f'{idx:03d}', str(idx)]:
             url = f'{BASE}/{seg_id}/layers/{fmt}{ext}'
             r = fetch_url(url, timeout=30)
@@ -195,7 +122,152 @@ def fetch_layers(seg_id, ext, num_layers, max_layers=16):
         print(f'[LAYERS] {len(layers)} layers loaded')
     return layers
 
-# ── Heuristic ink detection ───────────────────────────────────────────────────
+# ============================================================================
+# INFERENCE PATH 1: Kaggle 1st Place Model (3D UNETR + SegFormer)
+# ============================================================================
+
+def load_kaggle_model():
+    """Load the 1st place Kaggle solution model."""
+    try:
+        print('[KAGGLE] Loading 1st place model...')
+        import torch
+        from kaggle_model import Net
+
+        weight_paths = [
+            '/kaggle/input/ink-01-weight/fix-rot-00005904.model.pth',
+            '/tmp/fix-rot-00005904.model.pth',
+            'fix-rot-00005904.model.pth',
+        ]
+        weights_path = None
+        for path in weight_paths:
+            if os.path.exists(path):
+                weights_path = path
+                break
+
+        if weights_path is None:
+            try:
+                import kagglehub
+                path = kagglehub.model_download('ryches/vesuvius-ink-detection-1st-place/fix-rot-00005904')
+                if os.path.exists(path):
+                    weights_path = path
+            except ImportError:
+                pass
+
+        if weights_path is None:
+            print('[KAGGLE] Weights not found — skipping')
+            return None
+
+        model = Net()
+        state = torch.load(weights_path, map_location='cpu')
+        state_dict = state.get('state_dict', state)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('module.'):
+                k = k[7:]
+            new_state_dict[k] = v
+        model.load_state_dict(new_state_dict, strict=True)
+        model.eval()
+        print(f'[KAGGLE] Loaded 1st place model from {weights_path}')
+        return model
+    except Exception as e:
+        print(f'[KAGGLE] Error loading model: {e}')
+        return None
+
+def run_kaggle_inference(model, layers_stack):
+    """Run inference using the 1st place Kaggle model."""
+    import torch
+    try:
+        depth = 16
+        if len(layers_stack) < depth:
+            print(f'[KAGGLE] Only {len(layers_stack)} layers, need {depth}')
+            return None, None
+
+        indices = np.linspace(0, len(layers_stack)-1, depth, dtype=int)
+        selected = [layers_stack[i] for i in indices]
+
+        from skimage.transform import resize
+        resized = []
+        for layer in selected:
+            layer_norm = (layer - layer.min()) / (layer.max() - layer.min() + 1e-7)
+            resized.append(resize(layer_norm, (384, 384), preserve_range=True, mode='reflect'))
+
+        volume = np.stack(resized, axis=0).astype(np.float32)
+        input_tensor = torch.tensor(volume).unsqueeze(0)
+
+        with torch.no_grad():
+            output = model({'volume': input_tensor})
+            prob_map = output['ink'].squeeze().cpu().numpy()
+
+        threshold = 0.5
+        binary = (prob_map > threshold).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        letter_candidates = sum(1 for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] >= 20)
+        high_conf = prob_map[prob_map > 0.8]
+        score = float(high_conf.mean() * 100) if len(high_conf) > 0 else 0.0
+
+        print(f'[KAGGLE] score={score:.2f}, candidates={letter_candidates}')
+        return score, letter_candidates
+    except Exception as e:
+        print(f'[KAGGLE] Inference error: {e}')
+        return None, None
+
+# ============================================================================
+# INFERENCE PATH 2: TimeSformer (HuggingFace)
+# ============================================================================
+
+def load_timesformer():
+    """Load official Vesuvius TimeSformer from HuggingFace."""
+    try:
+        print('[TIMESFORMER] Loading scrollprize/timesformer_large_scroll1_01122024...')
+        from transformers import AutoModel
+        import torch
+        model = AutoModel.from_pretrained(
+            "scrollprize/timesformer_large_scroll1_01122024",
+            trust_remote_code=True,
+        )
+        model.eval()
+        print(f'[TIMESFORMER] Loaded ({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)')
+        return model
+    except Exception as e:
+        print(f'[TIMESFORMER] Failed: {e}')
+        return None
+
+def run_timesformer(model, layers_stack):
+    """Run inference using TimeSformer."""
+    import torch
+    try:
+        frames = []
+        for layer in layers_stack[:16]:
+            img = Image.fromarray((layer * 255).astype(np.uint8))
+            img = img.resize((224, 224), Image.LANCZOS)
+            rgb = Image.merge('RGB', [img, img, img])
+            frames.append(np.array(rgb, dtype=np.float32) / 255.0)
+
+        if not frames:
+            return None
+
+        video = np.stack(frames, axis=0)
+        video = np.transpose(video, (3, 0, 1, 2))
+        tensor = torch.tensor(video).unsqueeze(0).float()
+
+        with torch.no_grad():
+            features = model(pixel_values=tensor)
+            if hasattr(features, 'last_hidden_state'):
+                feat = features.last_hidden_state.squeeze()
+            else:
+                feat = features[0].squeeze()
+            feat_np = feat.numpy()
+            score = float(np.std(feat_np))
+            print(f'[TIMESFORMER] feature_std={score:.4f}')
+            return score
+    except Exception as e:
+        print(f'[TIMESFORMER] Inference error: {e}')
+        return None
+
+# ============================================================================
+# INFERENCE PATH 3: Heuristic (variance + gradient)
+# ============================================================================
+
 def heuristic_ink(image):
     h, w = image.shape
     patch_size = min(64, h//4, w//4)
@@ -224,25 +296,15 @@ def heuristic_ink(image):
     candidates = int(np.sum(arr > median * 3))
     return overall, candidates
 
-# ── Post callback ─────────────────────────────────────────────────────────────
-def post_callback(payload):
-    if not CALLBACK_URL:
-        print(json.dumps(payload, indent=2))
-        return
-    try:
-        r = requests.post(CALLBACK_URL, json=payload, timeout=15)
-        print(f'[CALLBACK] {r.status_code}')
-    except Exception as e:
-        print(f'[CALLBACK] error: {e}')
+# ============================================================================
+# MAIN: Run all three inference paths
+# ============================================================================
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    import random
     seg_id = SEGMENT_ID or random.choice(KNOWN_SEGMENTS)
     print(f'[START] segment={seg_id} layer={LAYER}')
 
-    # First check if community ink predictions already exist for this segment
-    # Sean Johnson (bruniss) and Emel Ryan have posted predictions to community uploads
+    # Check for community predictions
     community_pred_urls = [
         f'https://dl.ash2txt.org/community-uploads/bruniss/3d%20Ink%20/s3/{seg_id}/',
         f'https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s3/ink/{seg_id}/',
@@ -253,18 +315,9 @@ def main():
         r = fetch_url(pred_url, timeout=10)
         if r and r.status_code == 200 and len(r.content) > 200:
             print(f'[COMMUNITY] Found predictions at: {pred_url}')
-            # Extract any .png or .jpg prediction files
-            files = re.findall(r'href="([^"]+\.(?:png|jpg|zarr)[^"]*)"', r.text)
-            if files:
-                print(f'[COMMUNITY] Prediction files: {files[:5]}')
 
-    # Discover what's available
+    # Discover and load data
     info = discover_segment(seg_id)
-
-    # Load model
-    model, model_type = load_model()
-
-    # Load data
     layers = []
     composite = None
 
@@ -274,7 +327,6 @@ def main():
     if info['layer_ext'] and info['num_layers'] > 0:
         layers = fetch_layers(seg_id, info['layer_ext'], info['num_layers'])
 
-    # Pick best image for heuristic
     if composite is not None:
         image = composite
         source = 'composite'
@@ -283,29 +335,51 @@ def main():
         source = 'layers_mean'
     else:
         print('[ERROR] No data loaded')
-        post_callback({'job_id': JOB_ID, 'segment_id': seg_id,
-                       'score': 0.0, 'letter_candidates': 0,
-                       'status': 'no_data', 'mode': 'segment_surface'})
+        post_callback({
+            'job_id': JOB_ID, 'segment_id': seg_id,
+            'score': 0.0, 'letter_candidates': 0,
+            'status': 'no_data', 'mode': 'segment_surface'
+        })
         return
 
-    # Run inference
-    model_score = None
-    if model is not None and layers:
-        model_score = run_timesformer(model, layers)
+    # Load models
+    kaggle_model = load_kaggle_model()
+    timesformer_model = load_timesformer()
 
-    # Heuristic score
-    heuristic_score, candidates = heuristic_ink(image)
+    results = {}
 
-    # Final score: prefer model score if available
-    if model_score is not None:
-        final_score = model_score * 0.7 + heuristic_score * 0.3
-        mode = f'timesformer+heuristic_{source}'
+    # 1. Kaggle 1st Place (PRIMARY)
+    if kaggle_model is not None and layers:
+        kaggle_score, kaggle_candidates = run_kaggle_inference(kaggle_model, layers)
+        if kaggle_score is not None:
+            results['kaggle'] = {'score': kaggle_score, 'candidates': kaggle_candidates}
+
+    # 2. TimeSformer (SECONDARY)
+    if timesformer_model is not None and layers:
+        ts_score = run_timesformer(timesformer_model, layers)
+        if ts_score is not None:
+            results['timesformer'] = ts_score
+
+    # 3. Heuristic (FALLBACK)
+    heuristic_score, heuristic_candidates = heuristic_ink(image)
+    results['heuristic'] = {'score': heuristic_score, 'candidates': heuristic_candidates}
+
+    # Combine results: prefer Kaggle, then TimeSformer, then heuristic
+    if 'kaggle' in results:
+        final_score = results['kaggle']['score']
+        candidates = results['kaggle']['candidates']
+        mode = 'kaggle_1st_place'
+    elif 'timesformer' in results:
+        final_score = results['timesformer'] * 0.7 + results['heuristic']['score'] * 0.3
+        candidates = results['heuristic']['candidates']
+        mode = 'timesformer+heuristic'
     else:
-        final_score = heuristic_score
-        mode = f'heuristic_{source}'
+        final_score = results['heuristic']['score']
+        candidates = results['heuristic']['candidates']
+        mode = 'heuristic_only'
 
     mean_intensity = float(image.mean())
-    print(f'[INK] score={final_score:.4f} candidates={candidates} mean={mean_intensity:.4f} mode={mode}')
+    print(f'[INK] final_score={final_score:.4f} candidates={candidates} mean={mean_intensity:.4f} mode={mode}')
 
     # Thumbnail
     thumb = Image.fromarray((image * 255).astype(np.uint8))
@@ -326,6 +400,16 @@ def main():
         'mode':              mode,
         'status':            'ok',
     })
+
+def post_callback(payload):
+    if not CALLBACK_URL:
+        print(json.dumps(payload, indent=2))
+        return
+    try:
+        r = requests.post(CALLBACK_URL, json=payload, timeout=15)
+        print(f'[CALLBACK] {r.status_code}')
+    except Exception as e:
+        print(f'[CALLBACK] error: {e}')
 
 if __name__ == '__main__':
     main()
