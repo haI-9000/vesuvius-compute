@@ -17,15 +17,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install numpy tifffile requests boto3 Pillow
-          pip install scikit-image opencv-python
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install timm==0.9.2
-          pip install segmentation-models-pytorch==0.3.3
-          pip install timesformer_pytorch
-          pip install transformers huggingface-hub
-          pip install kagglehub
+        run: pip install numpy tifffile requests boto3 Pillow
 
       - name: Process scroll patch
         if: github.event.action == 'process_patch'
@@ -39,8 +31,6 @@ jobs:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           JOB_ID:       ${{ github.event.client_payload.job_id }}
           RECEIPT_ID:   ${{ github.event.client_payload.receipt_id }}
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python scripts/process_patch.py
 
       - name: Process scroll segment
@@ -52,6 +42,4 @@ jobs:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           JOB_ID:       ${{ github.event.client_payload.job_id }}
           RECEIPT_ID:   ${{ github.event.client_payload.receipt_id }}
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python scripts/process_segment.py
