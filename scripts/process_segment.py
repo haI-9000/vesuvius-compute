@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-Vesuvius Scroll 3 Segment Processor — TrustKernel compute layer
-Runs on GitHub Actions free tier. No model weights needed.
-
-Priority order:
-1. Community ink predictions (layers-overlay/) — Sean Johnson's actual output
-2. Composite image (composite.jpg) — max-projection surface render
-3. Surface layers (layers/*.tif or *.jpg) — raw CT surface data
-"""
 
 import os, io, re, json, requests
 import numpy as np
@@ -23,214 +14,171 @@ RECEIPT_ID   = os.environ.get('RECEIPT_ID', 'unknown')
 
 BASE = 'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths'
 
-KNOWN_SEGMENTS = [
+SEGMENTS = [
     '20231030220150', '20231031231220',
     '20240618142020', '20240618142021', '20240618142022',
     '20240712064330', '20240712071520', '20240712074250',
     '20240715203740', '20240716140050', '20240716140051', '20240716140052',
 ]
 
-def fetch_url(url, timeout=8):
-    for attempt in range(3):
+def get(url, timeout=10):
+    for _ in range(2):
         try:
             r = requests.get(url, timeout=timeout)
             return r
-        except Exception as e:
-            if attempt == 2:
-                print(f'[FETCH] Failed: {url} — {e}')
+        except:
+            pass
     return None
 
-def load_image(content, ext='.jpg'):
+def to_array(content, ext):
     try:
         if ext in ('.tif', '.tiff'):
             import tifffile
             img = tifffile.imread(io.BytesIO(content))
         else:
-            img = Image.open(io.BytesIO(content)).convert('L')
-            img = np.array(img)
+            img = np.array(Image.open(io.BytesIO(content)).convert('L'))
         arr = np.array(img, dtype=np.float32)
         if arr.ndim == 3:
             arr = arr.mean(axis=2)
-        mn, mx = arr.min(), arr.max()
-        if mx > mn:
-            arr = (arr - mn) / (mx - mn)
-        return arr
-    except Exception as e:
-        print(f'[LOAD] Error: {e}')
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo) if hi > lo else arr
+    except:
         return None
 
-def fetch_community_prediction(seg_id):
-    """Download Sean Johnson's layers-overlay predictions if available"""
-    overlay_url = f'{BASE}/{seg_id}/layers-overlay/'
-    r = fetch_url(overlay_url, timeout=8)
-    print(f'[COMMUNITY] Found predictions at: {overlay_url}')
-    files = re.findall(r'href="([^"]+\.(?:png|jpg|tif)[^"]*)"', r.text)
-    files = [f.strip('/') for f in files if not f.startswith('?')]
-    print(f'[COMMUNITY] Files: {files[:10]}')
-    
-    # Download first available prediction file
-    for fname in files[:5]:
-        ext = '.' + fname.split('.')[-1]
-        img_url = overlay_url.rstrip('/') + '/' + fname
-        img_r = fetch_url(img_url, timeout=10)
-        if img_r and img_r.status_code == 200:
-            arr = load_image(img_r.content, ext)
+def overlay(seg):
+    r = get(f'{BASE}/{seg}/layers-overlay/', timeout=5)
+    if not r or r.status_code != 200:
+        return None, None
+    print(f'[OVERLAY] {seg}')
+    files = [f.strip('/') for f in re.findall(r'href="(\d[^"]+\.(?:png|jpg|tif))"', r.text)]
+    print(f'[OVERLAY] {files[:8]}')
+    for f in files[:3]:
+        ext = '.' + f.rsplit('.', 1)[-1]
+        r2 = get(f'{BASE}/{seg}/layers-overlay/{f}', timeout=15)
+        if r2 and r2.status_code == 200:
+            arr = to_array(r2.content, ext)
             if arr is not None:
-                print(f'[COMMUNITY] Loaded: {fname} shape={arr.shape} mean={arr.mean():.4f}')
-                return arr, fname
+                print(f'[OVERLAY] loaded {f} {arr.shape} mean={arr.mean():.4f}')
+                return arr, f
     return None, None
 
-def fetch_composite(seg_id):
-    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=20)
+def composite(seg):
+    r = get(f'{BASE}/{seg}/composite.jpg', timeout=20)
     if not r or r.status_code != 200:
         return None
     try:
         img = Image.open(io.BytesIO(r.content)).convert('L')
         w, h = img.size
-        scale = min(1024/w, 1024/h, 1.0)
-        if scale < 1.0:
-            img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+        s = min(1024/w, 1024/h, 1.0)
+        if s < 1.0:
+            img = img.resize((int(w*s), int(h*s)), Image.LANCZOS)
         arr = np.array(img, dtype=np.float32) / 255.0
-        print(f'[COMPOSITE] shape={arr.shape} mean={arr.mean():.4f}')
+        print(f'[COMPOSITE] {arr.shape} mean={arr.mean():.4f}')
         return arr
-    except Exception as e:
-        print(f'[COMPOSITE] Error: {e}')
+    except:
         return None
 
-def discover_segment(seg_id):
-    info = {'layer_ext': None, 'num_layers': 0, 'has_composite': False}
-    r = fetch_url(f'{BASE}/{seg_id}/layers/')
+def discover(seg):
+    info = {'ext': None, 'n': 0, 'has_composite': False}
+    r = get(f'{BASE}/{seg}/layers/')
     if r and r.status_code == 200:
         files = re.findall(r'href="(\d+\.[a-z]+)"', r.text)
         if files:
-            info['layer_ext'] = '.' + files[0].split('.')[-1]
-            info['num_layers'] = len(files)
-            print(f'[DISCOVER] {len(files)} layers, ext={info["layer_ext"]}')
-    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=8)
+            info['ext'] = '.' + files[0].split('.')[-1]
+            info['n'] = len(files)
+            print(f'[LAYERS] {len(files)} layers ext={info["ext"]}')
+    r = get(f'{BASE}/{seg}/composite.jpg', timeout=5)
     if r and r.status_code == 200 and len(r.content) > 10000:
         info['has_composite'] = True
-        print(f'[DISCOVER] composite.jpg: {len(r.content)//1024}KB')
     return info
 
-def fetch_layers(seg_id, ext, num_layers, max_layers=16):
-    max_idx = min(num_layers - 1, 64)
-    indices = np.linspace(0, max_idx, min(max_layers, num_layers), dtype=int)
-    layers = []
-    target_shape = None
-    for idx in indices:
-        for fmt in [f'{idx:02d}', f'{idx:03d}', str(idx)]:
-            url = f'{BASE}/{seg_id}/layers/{fmt}{ext}'
-            r = fetch_url(url, timeout=10)
+def fetch_layers(seg, ext, n, max_n=16):
+    indices = np.linspace(0, min(n-1, 64), min(max_n, n), dtype=int)
+    layers, shape = [], None
+    for i in indices:
+        for fmt in [f'{i:02d}', f'{i:03d}']:
+            r = get(f'{BASE}/{seg}/layers/{fmt}{ext}', timeout=15)
             if r and r.status_code == 200:
-                arr = load_image(r.content, ext)
+                arr = to_array(r.content, ext)
                 if arr is not None:
-                    if target_shape is None:
-                        target_shape = arr.shape
-                    if arr.shape == target_shape:
+                    if shape is None: shape = arr.shape
+                    if arr.shape == shape:
                         layers.append(arr)
                         print(f'[LAYER] {fmt}{ext} {arr.shape} mean={arr.mean():.4f}')
                     break
-    if layers:
-        print(f'[LAYERS] {len(layers)} layers loaded')
     return layers
 
-def heuristic_ink(image):
-    h, w = image.shape
-    patch_size = min(64, h//4, w//4)
-    if patch_size < 8:
-        return 0.0, 0
-    stride = patch_size // 2
+def ink_score(img):
+    h, w = img.shape
+    ps = min(64, h//4, w//4)
+    if ps < 8: return 0.0, 0
+    st = ps // 2
     scores = []
-    for y in range(0, h - patch_size, stride):
-        for x in range(0, w - patch_size, stride):
-            p = image[y:y+patch_size, x:x+patch_size]
-            var = float(np.var(p))
-            gx = np.diff(p, axis=1)
-            gy = np.diff(p, axis=0)
-            grad = float(np.mean(np.abs(gx)) + np.mean(np.abs(gy)))
-            mean = float(p.mean())
-            score = var * 10 + grad * 5
-            if 0.05 < mean < 0.85:
-                score *= 1.3
-            scores.append(score)
-    if not scores:
-        return 0.0, 0
-    arr = np.array(scores)
-    top10 = np.sort(arr)[-max(1, len(arr)//10):]
-    overall = float(np.mean(top10))
-    median = float(np.median(arr))
-    candidates = int(np.sum(arr > median * 3))
-    return overall, candidates
+    for y in range(0, h - ps, st):
+        for x in range(0, w - ps, st):
+            p = img[y:y+ps, x:x+ps]
+            v = float(np.var(p))
+            g = float(np.mean(np.abs(np.diff(p, axis=1))) + np.mean(np.abs(np.diff(p, axis=0))))
+            s = v * 10 + g * 5
+            if 0.05 < p.mean() < 0.85:
+                s *= 1.3
+            scores.append(s)
+    if not scores: return 0.0, 0
+    a = np.array(scores)
+    score = float(np.mean(np.sort(a)[-max(1, len(a)//10):]))
+    cands = int(np.sum(a > np.median(a) * 3))
+    return score, cands
 
-def post_callback(payload):
+def callback(payload):
     if not CALLBACK_URL:
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(payload))
         return
     try:
         r = requests.post(CALLBACK_URL, json=payload, timeout=10)
         print(f'[CALLBACK] {r.status_code}')
     except Exception as e:
-        print(f'[CALLBACK] error: {e}')
+        print(f'[CALLBACK] {e}')
 
 def main():
     import random
-    seg_id = SEGMENT_ID or random.choice(KNOWN_SEGMENTS)
-    print(f'[START] segment={seg_id} layer={LAYER}')
+    seg = SEGMENT_ID or random.choice(SEGMENTS)
+    print(f'[START] {seg} layer={LAYER}')
 
-    # Priority 1: Community ink predictions (layers-overlay/)
-    community_image, community_file = fetch_community_prediction(seg_id)
-    
-    # Discover segment structure
-    info = discover_segment(seg_id)
+    ov_img, ov_file = overlay(seg)
+    info = discover(seg)
+    comp = composite(seg) if info['has_composite'] else None
+    layers = fetch_layers(seg, info['ext'], info['n']) if info['ext'] else []
 
-    # Priority 2: Composite image
-    composite = None
-    if info['has_composite']:
-        composite = fetch_composite(seg_id)
-
-    # Priority 3: Surface layers
-    layers = []
-    if info['layer_ext'] and info['num_layers'] > 0:
-        layers = fetch_layers(seg_id, info['layer_ext'], info['num_layers'])
-
-    # Select best image source
-    if community_image is not None:
-        image = community_image
-        source = f'community_overlay:{community_file}'
-    elif composite is not None:
-        image = composite
-        source = 'composite'
+    if ov_img is not None:
+        img, src = ov_img, f'overlay:{ov_file}'
+    elif comp is not None:
+        img, src = comp, 'composite'
     elif layers:
-        image = np.mean(layers, axis=0)
-        source = 'layers_mean'
+        img, src = np.mean(layers, axis=0), 'layers'
     else:
-        print('[ERROR] No data loaded')
-        post_callback({'job_id': JOB_ID, 'segment_id': seg_id,
-                       'score': 0.0, 'letter_candidates': 0,
-                       'status': 'no_data', 'mode': 'segment_surface'})
+        print('[ERROR] no data')
+        callback({'job_id': JOB_ID, 'segment_id': seg, 'score': 0.0,
+                  'letter_candidates': 0, 'status': 'no_data'})
         return
 
-    # Run ink heuristic
-    score, candidates = heuristic_ink(image)
-    mean_intensity = float(image.mean())
-    print(f'[INK] score={score:.4f} candidates={candidates} mean={mean_intensity:.4f} source={source}')
+    score, cands = ink_score(img)
+    mean = float(img.mean())
+    print(f'[INK] score={score:.4f} cands={cands} mean={mean:.4f} src={src}')
 
-    # Thumbnail for callback
-    thumb = Image.fromarray((image * 255).astype(np.uint8))
-    thumb = thumb.resize((16, 16), Image.LANCZOS)
+    thumb = Image.fromarray((img * 255).astype(np.uint8)).resize((16, 16), Image.LANCZOS)
     prob_map = [round(v/255.0, 4) for v in thumb.tobytes()]
 
-    post_callback({
+    callback({
         'job_id':            JOB_ID,
         'receipt_id':        RECEIPT_ID,
-        'segment_id':        seg_id,
+        'segment_id':        seg,
         'layer':             LAYER,
         'score':             round(score, 4),
-        'letter_candidates': candidates,
+        'letter_candidates': cands,
         'best_z_slice':      LAYER,
-        'mean_intensity':    round(mean_intensity, 6),
+        'mean_intensity':    round(mean, 6),
         'prob_map_16x16':    prob_map,
-        'mode':              f'heuristic_{source}',
+        'mode':              src,
         'status':            'ok',
     })
 
