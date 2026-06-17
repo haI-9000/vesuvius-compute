@@ -30,7 +30,7 @@ KNOWN_SEGMENTS = [
     '20240715203740', '20240716140050', '20240716140051', '20240716140052',
 ]
 
-def fetch_url(url, timeout=45):
+def fetch_url(url, timeout=8):
     for attempt in range(3):
         try:
             r = requests.get(url, timeout=timeout)
@@ -62,10 +62,7 @@ def load_image(content, ext='.jpg'):
 def fetch_community_prediction(seg_id):
     """Download Sean Johnson's layers-overlay predictions if available"""
     overlay_url = f'{BASE}/{seg_id}/layers-overlay/'
-    r = fetch_url(overlay_url, timeout=10)
-    if not r or r.status_code != 200:
-        return None, None
-    
+    r = fetch_url(overlay_url, timeout=8)
     print(f'[COMMUNITY] Found predictions at: {overlay_url}')
     files = re.findall(r'href="([^"]+\.(?:png|jpg|tif)[^"]*)"', r.text)
     files = [f.strip('/') for f in files if not f.startswith('?')]
@@ -75,7 +72,7 @@ def fetch_community_prediction(seg_id):
     for fname in files[:5]:
         ext = '.' + fname.split('.')[-1]
         img_url = overlay_url.rstrip('/') + '/' + fname
-        img_r = fetch_url(img_url, timeout=30)
+        img_r = fetch_url(img_url, timeout=10)
         if img_r and img_r.status_code == 200:
             arr = load_image(img_r.content, ext)
             if arr is not None:
@@ -84,7 +81,7 @@ def fetch_community_prediction(seg_id):
     return None, None
 
 def fetch_composite(seg_id):
-    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=60)
+    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=20)
     if not r or r.status_code != 200:
         return None
     try:
@@ -109,7 +106,7 @@ def discover_segment(seg_id):
             info['layer_ext'] = '.' + files[0].split('.')[-1]
             info['num_layers'] = len(files)
             print(f'[DISCOVER] {len(files)} layers, ext={info["layer_ext"]}')
-    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=10)
+    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=8)
     if r and r.status_code == 200 and len(r.content) > 10000:
         info['has_composite'] = True
         print(f'[DISCOVER] composite.jpg: {len(r.content)//1024}KB')
@@ -123,7 +120,7 @@ def fetch_layers(seg_id, ext, num_layers, max_layers=16):
     for idx in indices:
         for fmt in [f'{idx:02d}', f'{idx:03d}', str(idx)]:
             url = f'{BASE}/{seg_id}/layers/{fmt}{ext}'
-            r = fetch_url(url, timeout=30)
+            r = fetch_url(url, timeout=10)
             if r and r.status_code == 200:
                 arr = load_image(r.content, ext)
                 if arr is not None:
@@ -170,7 +167,7 @@ def post_callback(payload):
         print(json.dumps(payload, indent=2))
         return
     try:
-        r = requests.post(CALLBACK_URL, json=payload, timeout=15)
+        r = requests.post(CALLBACK_URL, json=payload, timeout=10)
         print(f'[CALLBACK] {r.status_code}')
     except Exception as e:
         print(f'[CALLBACK] error: {e}')
