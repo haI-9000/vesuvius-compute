@@ -3,6 +3,7 @@
 import os, io, re, json, requests
 import numpy as np
 from PIL import Image
+import signal
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -15,20 +16,35 @@ RECEIPT_ID   = os.environ.get('RECEIPT_ID', 'unknown')
 BASE = 'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths'
 
 SEGMENTS = [
-    '20231030220150', '20231031231220',
-    '20240618142020', '20240618142021', '20240618142022',
-    '20240712064330', '20240712071520', '20240712074250',
-    '20240715203740', '20240716140050', '20240716140051', '20240716140052',
+    '20240715203740',  # confirmed ink coordinate — Ryan zarr val=244/255
+    '20240712074250', '20240712071520',
+    '20240618142021', '20240618142022',
+    '20240716140050', '20240716140051', '20240716140052',
+    '20240712064330', '20240618142020',
 ]
 
-def get(url, timeout=10):
-    for _ in range(2):
-        try:
-            r = requests.get(url, timeout=timeout)
-            return r
-        except:
-            pass
-    return None
+# Hard kill after 100s — GitHub job timeout is 3 min, we want clean exit
+def _timeout_handler(signum, frame):
+    print('[TIMEOUT] hard limit reached, sending fallback callback')
+    callback({
+        'job_id': JOB_ID, 'receipt_id': RECEIPT_ID,
+        'segment_id': SEGMENT_ID, 'layer': LAYER,
+        'score': 0.0, 'letter_candidates': 0,
+        'status': 'timeout', 'mean_intensity': 0.0,
+        'prob_map_16x16': [], 'mode': 'timeout',
+    })
+    raise SystemExit(0)
+
+signal.signal(signal.SIGALRM, _timeout_handler)
+signal.alarm(100)  # 100s hard limit
+
+def get(url, timeout=8):
+    try:
+        r = requests.get(url, timeout=timeout)
+        return r
+    except Exception as e:
+        print(f'[GET] failed {url}: {e}')
+        return None
 
 def to_array(content, ext):
     try:
@@ -42,28 +58,12 @@ def to_array(content, ext):
             arr = arr.mean(axis=2)
         lo, hi = arr.min(), arr.max()
         return (arr - lo) / (hi - lo) if hi > lo else arr
-    except:
+    except Exception as e:
+        print(f'[ARRAY] {e}')
         return None
 
-def overlay(seg):
-    r = get(f'{BASE}/{seg}/layers-overlay/', timeout=5)
-    if not r or r.status_code != 200:
-        return None, None
-    print(f'[OVERLAY] {seg}')
-    files = [f.strip('/') for f in re.findall(r'href="(\d[^"]+\.(?:png|jpg|tif))"', r.text)]
-    print(f'[OVERLAY] {files[:8]}')
-    for f in files[:3]:
-        ext = '.' + f.rsplit('.', 1)[-1]
-        r2 = get(f'{BASE}/{seg}/layers-overlay/{f}', timeout=15)
-        if r2 and r2.status_code == 200:
-            arr = to_array(r2.content, ext)
-            if arr is not None:
-                print(f'[OVERLAY] loaded {f} {arr.shape} mean={arr.mean():.4f}')
-                return arr, f
-    return None, None
-
 def composite(seg):
-    r = get(f'{BASE}/{seg}/composite.jpg', timeout=20)
+    r = get(f'{BASE}/{seg}/composite.jpg', timeout=15)
     if not r or r.status_code != 200:
         return None
     try:
@@ -73,48 +73,41 @@ def composite(seg):
         if s < 1.0:
             img = img.resize((int(w*s), int(h*s)), Image.LANCZOS)
         arr = np.array(img, dtype=np.float32) / 255.0
-        print(f'[COMPOSITE] {arr.shape} mean={arr.mean():.4f}')
+        print(f'[COMPOSITE] {seg} {arr.shape} mean={arr.mean():.4f}')
         return arr
-    except:
+    except Exception as e:
+        print(f'[COMPOSITE] {e}')
         return None
 
 def discover(seg):
     info = {'ext': None, 'n': 0, 'has_composite': False}
-    r = get(f'{BASE}/{seg}/layers/')
+    r = get(f'{BASE}/{seg}/layers/', timeout=8)
     if r and r.status_code == 200:
         files = re.findall(r'href="(\d+\.[a-z]+)"', r.text)
         if files:
             info['ext'] = '.' + files[0].split('.')[-1]
             info['n'] = len(files)
             print(f'[LAYERS] {len(files)} layers ext={info["ext"]}')
-    r = get(f'{BASE}/{seg}/composite.jpg', timeout=5)
+    r = get(f'{BASE}/{seg}/composite.jpg', timeout=8)
     if r and r.status_code == 200 and len(r.content) > 10000:
         info['has_composite'] = True
     return info
 
-def fetch_layers(seg, ext, n, max_n=16):
-    indices = np.linspace(0, min(n-1, 64), min(max_n, n), dtype=int)
-    layers, shape = [], None
-    for i in indices:
-        for fmt in [f'{i:02d}', f'{i:03d}']:
-            r = get(f'{BASE}/{seg}/layers/{fmt}{ext}', timeout=15)
-            if r and r.status_code == 200:
-                arr = to_array(r.content, ext)
-                if arr is not None:
-                    if shape is None: shape = arr.shape
-                    if arr.shape == shape:
-                        layers.append(arr)
-                        print(f'[LAYER] {fmt}{ext} {arr.shape} mean={arr.mean():.4f}')
-                    break
-    return layers
+def fetch_one_layer(seg, ext, layer_idx):
+    for fmt in [f'{layer_idx:02d}', f'{layer_idx:03d}']:
+        r = get(f'{BASE}/{seg}/layers/{fmt}{ext}', timeout=15)
+        if r and r.status_code == 200:
+            arr = to_array(r.content, ext)
+            if arr is not None:
+                print(f'[LAYER] {fmt}{ext} {arr.shape} mean={arr.mean():.4f}')
+                return arr
+    return None
 
 def ink_score(img):
-    # Fast heuristic: mean intensity + standard deviation
     mean = float(np.mean(img))
-    std = float(np.std(img))
-    # Score = mean + std (higher is more interesting)
+    std  = float(np.std(img))
     score = mean + std * 2
-    return score, 0
+    return score
 
 def callback(payload):
     if not CALLBACK_URL:
@@ -122,38 +115,50 @@ def callback(payload):
         return
     try:
         r = requests.post(CALLBACK_URL, json=payload, timeout=10)
-        print(f'[CALLBACK] {r.status_code}')
+        print(f'[CALLBACK] {r.status_code} {r.text[:100]}')
     except Exception as e:
         print(f'[CALLBACK] {e}')
 
 def main():
     import random
     seg = SEGMENT_ID or random.choice(SEGMENTS)
-    print(f'[START] {seg} layer={LAYER}')
+    print(f'[START] seg={seg} layer={LAYER} job={JOB_ID}')
 
-    ov_img, ov_file = overlay(seg)
+    img = None
+    src = 'none'
+
+    # Try composite first — fastest single download
     info = discover(seg)
-    comp = composite(seg) if info['has_composite'] else None
-    layers = fetch_layers(seg, info['ext'], info['n']) if info['ext'] else []
 
-    if ov_img is not None:
-        img, src = ov_img, f'overlay:{ov_file}'
-    elif comp is not None:
-        img, src = comp, 'composite'
-    elif layers:
-        img, src = np.mean(layers, axis=0), 'layers'
-    else:
-        print('[ERROR] no data')
-        callback({'job_id': JOB_ID, 'segment_id': seg, 'score': 0.0,
-                  'letter_candidates': 0, 'status': 'no_data'})
+    if info['has_composite']:
+        img = composite(seg)
+        if img is not None:
+            src = 'composite'
+
+    # Fall back to single layer
+    if img is None and info['ext'] and info['n'] > 0:
+        idx = min(LAYER, info['n'] - 1)
+        img = fetch_one_layer(seg, info['ext'], idx)
+        if img is not None:
+            src = f'layer:{idx}'
+
+    if img is None:
+        print('[ERROR] no data retrieved')
+        callback({
+            'job_id': JOB_ID, 'receipt_id': RECEIPT_ID,
+            'segment_id': seg, 'layer': LAYER,
+            'score': 0.0, 'letter_candidates': 0,
+            'status': 'no_data', 'mean_intensity': 0.0,
+            'prob_map_16x16': [], 'mode': 'no_data',
+        })
         return
 
-    score, cands = ink_score(img)
-    mean = float(img.mean())
+    score = ink_score(img)
+    mean  = float(img.mean())
 
-    print(f'[INK] score={score:.4f} cands={cands} mean={mean:.4f} src={src}')
+    print(f'[INK] score={score:.4f} mean={mean:.4f} src={src}')
 
-    thumb = Image.fromarray((img * 255).astype(np.uint8)).resize((16, 16), Image.LANCZOS)
+    thumb    = Image.fromarray((img * 255).astype(np.uint8)).resize((16, 16), Image.LANCZOS)
     prob_map = [round(v/255.0, 4) for v in thumb.tobytes()]
 
     callback({
@@ -162,7 +167,7 @@ def main():
         'segment_id':        seg,
         'layer':             LAYER,
         'score':             round(score, 4),
-        'letter_candidates': cands,
+        'letter_candidates': 0,
         'best_z_slice':      LAYER,
         'mean_intensity':    round(mean, 6),
         'prob_map_16x16':    prob_map,
