@@ -139,40 +139,13 @@ def callback(payload):
     except Exception as e:
         print(f'[CALLBACK] {e}')
 
-def sample_ryches_zarr(seg_id):
-    """
-    Sample Ryan Chesler's 3D ink predictions for Scroll 3.
-    zarr at dl.ash2txt.org/community-uploads/ryan/3d_predictions_scroll3_invariant.zarr
-    Returns mean ink probability for a region around the segment centroid.
-    """
-    try:
-        import zarr
-        import fsspec
-        store_url = 'https://dl.ash2txt.org/community-uploads/ryan/3d_predictions_scroll3_invariant.zarr'
-        store = fsspec.get_mapper(store_url)
-        z = zarr.open(store, mode='r')
-        print(f'[ZARR] shape={z.shape} dtype={z.dtype}')
-        # Sample center slice
-        cz = z.shape[0] // 2
-        cy = z.shape[1] // 2
-        cx = z.shape[2] // 2
-        patch = z[cz-32:cz+32, cy-64:cy+64, cx-64:cx+64]
-        arr = patch.astype(np.float32)
-        mean_ink = float(arr.mean())
-        max_ink = float(arr.max())
-        print(f'[ZARR] mean={mean_ink:.4f} max={max_ink:.4f}')
-        return mean_ink, max_ink, arr
-    except Exception as e:
-        print(f'[ZARR] failed: {e}')
-        return None, None, None
-
 def main():
     import random
     seg = SEGMENT_ID or random.choice(SEGMENTS)
     print(f'[START] {seg} layer={LAYER}')
 
-    # Try Ryan Chesler's 3D predictions first
-    zarr_mean, zarr_max, zarr_patch = sample_ryches_zarr(seg)
+    # Zarr disabled — hangs on remote open, kills job at 47s
+    zarr_mean, zarr_max = None, None
 
     ov_img, ov_file = overlay(seg)
     info = discover(seg)
@@ -194,13 +167,7 @@ def main():
     score, cands = ink_score(img)
     mean = float(img.mean())
 
-    # Blend with zarr score if available
-    zarr_src = ''
-    if zarr_mean is not None:
-        score = score * 0.3 + zarr_mean * 100 * 0.7
-        zarr_src = f'+zarr(mean={zarr_mean:.4f},max={zarr_max:.4f})'
-
-    print(f'[INK] score={score:.4f} cands={cands} mean={mean:.4f} src={src}{zarr_src}')
+    print(f'[INK] score={score:.4f} cands={cands} mean={mean:.4f} src={src}')
 
     thumb = Image.fromarray((img * 255).astype(np.uint8)).resize((16, 16), Image.LANCZOS)
     prob_map = [round(v/255.0, 4) for v in thumb.tobytes()]
