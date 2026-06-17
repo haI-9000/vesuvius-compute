@@ -103,8 +103,12 @@ def fetch_layers(seg, ext, n, max_n=16):
     return layers
 
 def ink_score(img):
-    h, w = img.shape
-    ps = min(64, h//4, w//4)
+    # Fast heuristic: mean intensity + standard deviation
+    mean = float(np.mean(img))
+    std = float(np.std(img))
+    # Score = mean + std (higher is more interesting)
+    score = mean + std * 2
+    return score, 0
     if ps < 8: return 0.0, 0
     st = ps // 2
     scores = []
