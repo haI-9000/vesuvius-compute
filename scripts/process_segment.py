@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-import os, sys, io, re, json, requests
+"""
+Vesuvius Scroll 3 Segment Processor — TrustKernel compute layer
+Runs on GitHub Actions free tier. No model weights needed.
+
+Priority order:
+1. Community ink predictions (layers-overlay/) — Sean Johnson's actual output
+2. Composite image (composite.jpg) — max-projection surface render
+3. Surface layers (layers/*.tif or *.jpg) — raw CT surface data
+"""
+
+import os, io, re, json, requests
 import numpy as np
 from PIL import Image
-import cv2
-import random
-import time
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -31,7 +38,6 @@ def fetch_url(url, timeout=45):
         except Exception as e:
             if attempt == 2:
                 print(f'[FETCH] Failed: {url} — {e}')
-            time.sleep(1)
     return None
 
 def load_image(content, ext='.jpg'):
@@ -53,20 +59,29 @@ def load_image(content, ext='.jpg'):
         print(f'[LOAD] Error: {e}')
         return None
 
-def discover_segment(seg_id):
-    info = {'has_composite': False, 'layer_ext': None, 'num_layers': 0}
-    r = fetch_url(f'{BASE}/{seg_id}/layers/')
-    if r and r.status_code == 200:
-        files = re.findall(r'href="(\d+\.[a-z]+)"', r.text)
-        if files:
-            info['layer_ext'] = '.' + files[0].split('.')[-1]
-            info['num_layers'] = len(files)
-            print(f'[DISCOVER] {len(files)} layers, ext={info["layer_ext"]}')
-    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=10)
-    if r and r.status_code == 200 and len(r.content) > 10000:
-        info['has_composite'] = True
-        print(f'[DISCOVER] composite.jpg: {len(r.content)//1024}KB')
-    return info
+def fetch_community_prediction(seg_id):
+    """Download Sean Johnson's layers-overlay predictions if available"""
+    overlay_url = f'{BASE}/{seg_id}/layers-overlay/'
+    r = fetch_url(overlay_url, timeout=10)
+    if not r or r.status_code != 200:
+        return None, None
+    
+    print(f'[COMMUNITY] Found predictions at: {overlay_url}')
+    files = re.findall(r'href="([^"]+\.(?:png|jpg|tif)[^"]*)"', r.text)
+    files = [f.strip('/') for f in files if not f.startswith('?')]
+    print(f'[COMMUNITY] Files: {files[:10]}')
+    
+    # Download first available prediction file
+    for fname in files[:5]:
+        ext = '.' + fname.split('.')[-1]
+        img_url = overlay_url.rstrip('/') + '/' + fname
+        img_r = fetch_url(img_url, timeout=30)
+        if img_r and img_r.status_code == 200:
+            arr = load_image(img_r.content, ext)
+            if arr is not None:
+                print(f'[COMMUNITY] Loaded: {fname} shape={arr.shape} mean={arr.mean():.4f}')
+                return arr, fname
+    return None, None
 
 def fetch_composite(seg_id):
     r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=60)
@@ -84,6 +99,21 @@ def fetch_composite(seg_id):
     except Exception as e:
         print(f'[COMPOSITE] Error: {e}')
         return None
+
+def discover_segment(seg_id):
+    info = {'layer_ext': None, 'num_layers': 0, 'has_composite': False}
+    r = fetch_url(f'{BASE}/{seg_id}/layers/')
+    if r and r.status_code == 200:
+        files = re.findall(r'href="(\d+\.[a-z]+)"', r.text)
+        if files:
+            info['layer_ext'] = '.' + files[0].split('.')[-1]
+            info['num_layers'] = len(files)
+            print(f'[DISCOVER] {len(files)} layers, ext={info["layer_ext"]}')
+    r = fetch_url(f'{BASE}/{seg_id}/composite.jpg', timeout=10)
+    if r and r.status_code == 200 and len(r.content) > 10000:
+        info['has_composite'] = True
+        print(f'[DISCOVER] composite.jpg: {len(r.content)//1024}KB')
+    return info
 
 def fetch_layers(seg_id, ext, num_layers, max_layers=16):
     max_idx = min(num_layers - 1, 64)
@@ -106,145 +136,6 @@ def fetch_layers(seg_id, ext, num_layers, max_layers=16):
     if layers:
         print(f'[LAYERS] {len(layers)} layers loaded')
     return layers
-
-def load_kaggle_model():
-    try:
-        print('[KAGGLE] Loading model...')
-        import torch
-        try:
-            from kaggle_model import Net
-        except ImportError:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from kaggle_model import Net
-
-        weight_paths = [
-            '/kaggle/input/ink-01-weight/fix-rot-00005904.model.pth',
-            '/tmp/fix-rot-00005904.model.pth',
-            'fix-rot-00005904.model.pth',
-        ]
-        weights_path = None
-        for path in weight_paths:
-            if os.path.exists(path):
-                weights_path = path
-                break
-
-        if weights_path is None:
-            try:
-                import kagglehub
-                path = kagglehub.model_download('ryches/vesuvius-ink-detection-1st-place/fix-rot-00005904')
-                if os.path.exists(path):
-                    weights_path = path
-            except Exception:
-                pass
-
-        if weights_path is None:
-            print('[KAGGLE] Weights not found')
-            return None
-
-        print(f'[KAGGLE] Loading weights from {weights_path}')
-        model = Net()
-        state = torch.load(weights_path, map_location='cpu')
-        state_dict = state.get('state_dict', state)
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith('module.'):
-                k = k[7:]
-            new_state_dict[k] = v
-        model.load_state_dict(new_state_dict, strict=False)
-        model.eval()
-        print('[KAGGLE] Model loaded')
-        return model
-    except Exception as e:
-        print(f'[KAGGLE] Error: {e}')
-        return None
-
-def run_kaggle_inference(model, layers_stack):
-    try:
-        import torch
-        from skimage.transform import resize
-
-        depth = 16
-        if len(layers_stack) < depth:
-            return None, None
-
-        indices = np.linspace(0, len(layers_stack)-1, depth, dtype=int)
-        selected = [layers_stack[i] for i in indices]
-
-        resized = []
-        for layer in selected:
-            layer_norm = (layer - layer.min()) / (layer.max() - layer.min() + 1e-7)
-            resized.append(resize(layer_norm, (384, 384), preserve_range=True, mode='reflect'))
-
-        volume = np.stack(resized, axis=0).astype(np.float32)
-        input_tensor = torch.tensor(volume).unsqueeze(0)
-
-        with torch.no_grad():
-            output = model({'volume': input_tensor})
-            prob_map = output['ink'].squeeze().cpu().numpy()
-
-        threshold = 0.5
-        binary = (prob_map > threshold).astype(np.uint8)
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-        letter_candidates = sum(1 for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] >= 20)
-        high_conf = prob_map[prob_map > 0.8]
-        score = float(high_conf.mean() * 100) if len(high_conf) > 0 else 0.0
-
-        print(f'[KAGGLE] score={score:.2f}, candidates={letter_candidates}')
-        return score, letter_candidates
-    except Exception as e:
-        print(f'[KAGGLE] Inference error: {e}')
-        return None, None
-
-def load_timesformer():
-    try:
-        print('[TIMESFORMER] Loading...')
-        try:
-            import timesformer_pytorch
-        except ImportError:
-            print('[TIMESFORMER] timesformer_pytorch not installed')
-            return None
-
-        from transformers import AutoModel
-        model = AutoModel.from_pretrained(
-            "scrollprize/timesformer_large_scroll1_01122024",
-            trust_remote_code=True,
-        )
-        model.eval()
-        return model
-    except Exception as e:
-        print(f'[TIMESFORMER] Error: {e}')
-        return None
-
-def run_timesformer(model, layers_stack):
-    try:
-        import torch
-        frames = []
-        for layer in layers_stack[:16]:
-            img = Image.fromarray((layer * 255).astype(np.uint8))
-            img = img.resize((224, 224), Image.LANCZOS)
-            rgb = Image.merge('RGB', [img, img, img])
-            frames.append(np.array(rgb, dtype=np.float32) / 255.0)
-
-        if not frames:
-            return None
-
-        video = np.stack(frames, axis=0)
-        video = np.transpose(video, (3, 0, 1, 2))
-        tensor = torch.tensor(video).unsqueeze(0).float()
-
-        with torch.no_grad():
-            features = model(pixel_values=tensor)
-            if hasattr(features, 'last_hidden_state'):
-                feat = features.last_hidden_state.squeeze()
-            else:
-                feat = features[0].squeeze()
-            feat_np = feat.numpy()
-            score = float(np.std(feat_np))
-            print(f'[TIMESFORMER] score={score:.4f}')
-            return score
-    except Exception as e:
-        print(f'[TIMESFORMER] Inference error: {e}')
-        return None
 
 def heuristic_ink(image):
     h, w = image.shape
@@ -285,83 +176,49 @@ def post_callback(payload):
         print(f'[CALLBACK] error: {e}')
 
 def main():
+    import random
     seg_id = SEGMENT_ID or random.choice(KNOWN_SEGMENTS)
     print(f'[START] segment={seg_id} layer={LAYER}')
 
-    community_pred_urls = [
-        f'https://dl.ash2txt.org/community-uploads/bruniss/3d%20Ink%20/s3/{seg_id}/',
-        f'https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s3/ink/{seg_id}/',
-        f'https://dl.ash2txt.org/community-uploads/ryan/s3/{seg_id}/',
-        f'https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/paths/{seg_id}/layers-overlay/',
-    ]
-    for pred_url in community_pred_urls:
-        r = fetch_url(pred_url, timeout=10)
-        if r and r.status_code == 200 and len(r.content) > 200:
-            print(f'[COMMUNITY] Predictions: {pred_url}')
-
+    # Priority 1: Community ink predictions (layers-overlay/)
+    community_image, community_file = fetch_community_prediction(seg_id)
+    
+    # Discover segment structure
     info = discover_segment(seg_id)
-    layers = []
-    composite = None
 
+    # Priority 2: Composite image
+    composite = None
     if info['has_composite']:
         composite = fetch_composite(seg_id)
 
+    # Priority 3: Surface layers
+    layers = []
     if info['layer_ext'] and info['num_layers'] > 0:
         layers = fetch_layers(seg_id, info['layer_ext'], info['num_layers'])
 
-    if composite is not None:
+    # Select best image source
+    if community_image is not None:
+        image = community_image
+        source = f'community_overlay:{community_file}'
+    elif composite is not None:
         image = composite
         source = 'composite'
     elif layers:
         image = np.mean(layers, axis=0)
         source = 'layers_mean'
     else:
-        print('[ERROR] No data')
-        post_callback({
-            'job_id': JOB_ID,
-            'receipt_id': RECEIPT_ID,
-            'segment_id': seg_id,
-            'score': 0.0,
-            'letter_candidates': 0,
-            'status': 'no_data',
-            'mode': 'segment_surface'
-        })
+        print('[ERROR] No data loaded')
+        post_callback({'job_id': JOB_ID, 'segment_id': seg_id,
+                       'score': 0.0, 'letter_candidates': 0,
+                       'status': 'no_data', 'mode': 'segment_surface'})
         return
 
-    kaggle_model = load_kaggle_model()
-    timesformer_model = load_timesformer()
-
-    results = {}
-
-    if kaggle_model is not None and layers:
-        kaggle_score, kaggle_candidates = run_kaggle_inference(kaggle_model, layers)
-        if kaggle_score is not None:
-            results['kaggle'] = {'score': kaggle_score, 'candidates': kaggle_candidates}
-
-    if timesformer_model is not None and layers:
-        ts_score = run_timesformer(timesformer_model, layers)
-        if ts_score is not None:
-            results['timesformer'] = ts_score
-
-    heuristic_score, heuristic_candidates = heuristic_ink(image)
-    results['heuristic'] = {'score': heuristic_score, 'candidates': heuristic_candidates}
-
-    if 'kaggle' in results:
-        final_score = results['kaggle']['score']
-        candidates = results['kaggle']['candidates']
-        mode = 'kaggle_1st_place'
-    elif 'timesformer' in results:
-        final_score = results['timesformer'] * 0.7 + results['heuristic']['score'] * 0.3
-        candidates = results['heuristic']['candidates']
-        mode = 'timesformer+heuristic'
-    else:
-        final_score = results['heuristic']['score']
-        candidates = results['heuristic']['candidates']
-        mode = 'heuristic_only'
-
+    # Run ink heuristic
+    score, candidates = heuristic_ink(image)
     mean_intensity = float(image.mean())
-    print(f'[INK] score={final_score:.4f} candidates={candidates} mean={mean_intensity:.4f} mode={mode}')
+    print(f'[INK] score={score:.4f} candidates={candidates} mean={mean_intensity:.4f} source={source}')
 
+    # Thumbnail for callback
     thumb = Image.fromarray((image * 255).astype(np.uint8))
     thumb = thumb.resize((16, 16), Image.LANCZOS)
     prob_map = [round(v/255.0, 4) for v in thumb.tobytes()]
@@ -370,14 +227,13 @@ def main():
         'job_id':            JOB_ID,
         'receipt_id':        RECEIPT_ID,
         'segment_id':        seg_id,
-        'scroll_path':       'Scroll3/PHerc332.volpkg',
         'layer':             LAYER,
-        'score':             round(final_score, 4),
+        'score':             round(score, 4),
         'letter_candidates': candidates,
         'best_z_slice':      LAYER,
         'mean_intensity':    round(mean_intensity, 6),
         'prob_map_16x16':    prob_map,
-        'mode':              mode,
+        'mode':              f'heuristic_{source}',
         'status':            'ok',
     })
 
